@@ -1,0 +1,81 @@
+:root {
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  color: #1f2328;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+.app { height: 100vh; display: flex; flex-direction: column; }
+
+.topbar {
+  display: flex; align-items: center; gap: 8px; padding: 10px 16px;
+  background: #1f2937; color: #fff; flex-wrap: wrap;
+}
+.topbar h1 { font-size: 17px; margin-right: 12px; font-weight: 600; }
+.topbar select,
+.topbar button {
+  border: 1px solid #4b5563; background: #374151; color: #fff;
+  border-radius: 6px; padding: 6px 12px; font-size: 13px; cursor: pointer;
+}
+.topbar button:disabled { opacity: .4; cursor: not-allowed; }
+.topbar .btn-primary { background: #2563eb; border-color: #2563eb; }
+.topbar .btn-danger { background: #b91c1c; border-color: #b91c1c; }
+.topbar .btn-warn { background: #ca8a04; border-color: #a16207; }
+.topbar .btn-warn.active { box-shadow: 0 0 0 2px #fde68a inset; }
+
+.error-bar { background: #fee2e2; color: #991b1b; padding: 6px 16px; font-size: 13px; }
+
+.main { flex: 1; display: flex; min-height: 0; }
+.canvas-wrap { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.status-line { display: flex; gap: 12px; align-items: center; padding: 8px 16px; border-bottom: 1px solid #e5e7eb; font-size: 13px; }
+.canvas { flex: 1; }
+
+.badge { padding: 3px 10px; border-radius: 999px; font-size: 12px; color: #fff; background: #6b7280; }
+.badge-running { background: #2563eb; }
+.badge-waiting { background: #ca8a04; }
+.badge-paused { background: #6b7280; }
+.badge-cancelling { background: #c2410c; }
+.badge-succeeded { background: #15803d; }
+.badge-failed { background: #b91c1c; }
+.badge-cancelled { background: #525252; }
+.badge-interrupted { background: #7c2d12; }
+
+.sidebar { width: 360px; border-left: 1px solid #e5e7eb; display: flex; flex-direction: column; }
+.panel { padding: 14px 16px; border-bottom: 1px solid #e5e7eb; }
+.panel h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: #6b7280; margin-bottom: 10px; }
+.panel dl { display: grid; grid-template-columns: 70px 1fr; gap: 6px 10px; font-size: 13px; }
+.panel dt { color: #6b7280; }
+.panel-log { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
+.panel-log ul { list-style: none; overflow-y: auto; flex: 1; font-size: 12px; }
+.panel-log li { padding: 5px 8px; border-bottom: 1px solid #f3f4f6; display: flex; gap: 8px; align-items: baseline; }
+.event-seq { color: #9ca3af; min-width: 34px; }
+.event-node { margin-left: auto; background: #f3f4f6; padding: 1px 6px; border-radius: 4px; color: #4b5563; font-family: monospace; }
+.event-node_failed .event-msg, .event-node_cancelled .event-msg { color: #b91c1c; }
+.event-branch_taken .event-msg { color: #c2410c; }
+.event-node_waiting .event-msg { color: #a16207; }
+.event-node_succeeded .event-msg { color: #15803d; }
+.muted { color: #9ca3af; }
+
+.task-node {
+  width: 170px; border-radius: 10px; padding: 10px 12px;
+  background: #fff; border: 2px solid #d1d5db; font-size: 12px;
+  box-shadow: 0 1px 3px rgba(0,0,0,.08);
+}
+.task-node__type { font-size: 10px; color: #6b7280; font-weight: 700; }
+.task-node__label { font-weight: 600; margin: 2px 0; font-size: 13px; }
+.task-node__params { color: #6b7280; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.task-node__status { margin-top: 5px; min-height: 16px; font-weight: 600; }
+.task-node.running { border-color: #2563eb; background: #eff6ff; }
+.task-node.waiting, .task-node.cancelling { border-color: #ca8a04; background: #fffbeb; }
+.task-node.succeeded { border-color: #15803d; background: #f0fdf4; }
+.task-node.failed { border-color: #dc2626; background: #fef2f2; }
+.task-node.cancelled { border-color: #737373; background: #f5f5f5; opacity: .85; }
+.task-node.failed .task-node__status { color: #b91c1c; }
+.task-node.succeeded .task-node__status { color: #15803d; }
+.task-node.waiting .task-node__status { color: #a16207; }
+.task-node.cancelled .task-node__status { color: #525252; }
+.waiting-pulse { animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(202,138,4,.35);} 50% { box-shadow: 0 0 0 6px rgba(202,138,4,0);} }
+
+.edge-failure { stroke-dasharray: 6 4; }
+.react-flow__edge.edge-failure path { stroke: #e5484d; }
