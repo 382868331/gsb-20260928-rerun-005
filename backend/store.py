@@ -31,6 +31,7 @@ class Store:
                     id TEXT PRIMARY KEY,
                     flow_id TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    termination_reason TEXT,
                     started_at TEXT NOT NULL DEFAULT (datetime('now')),
                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
                 );
@@ -53,8 +54,24 @@ class Store:
                     message TEXT,
                     data TEXT
                 );
+                CREATE TABLE IF NOT EXISTS node_followups(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    execution_id TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    attempt INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    detail TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
                 """
             )
+            # 旧库升级：补充终止原因列
+            cols = {r[1] for r in self._conn.execute(
+                "PRAGMA table_info(executions)")}
+            if "termination_reason" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE executions ADD COLUMN termination_reason TEXT")
 
     def save_flow(self, flow_id: str, name: str, definition: dict[str, Any]) -> None:
         with self._lock, self._conn:
@@ -94,12 +111,84 @@ class Store:
                 (execution_id, flow_id),
             )
 
-    def set_execution_status(self, execution_id: str, status: str) -> None:
+    def set_execution_status(
+        self, execution_id: str, status: str, reason: str | None = None,
+    ) -> None:
+        with self._lock, self._conn:
+            if reason is None:
+                self._conn.execute(
+                    "UPDATE executions SET status=?, updated_at=datetime('now') WHERE id=?",
+                    (status, execution_id),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE executions SET status=?, termination_reason=?, "
+                    "updated_at=datetime('now') WHERE id=?",
+                    (status, reason, execution_id),
+                )
+
+    def get_termination_reason(self, execution_id: str) -> str | None:
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT termination_reason FROM executions WHERE id=?",
+                (execution_id,),
+            ).fetchone()
+        return r[0] if r else None
+
+    NODE_TERMINAL_STATUSES = {
+        "succeeded", "failed", "cancelled", "aborted",
+    }
+
+    def node_run_status(self, execution_id: str, node_id: str, attempt: int) -> str | None:
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT status FROM node_runs WHERE execution_id=? AND node_id=? AND attempt=?",
+                (execution_id, node_id, attempt),
+            ).fetchone()
+        return r[0] if r else None
+
+    def finish_node_run_guarded(
+        self, execution_id: str, node_id: str, attempt: int, status: str,
+        detail: str | None = None,
+    ) -> bool:
+        """终态保护：节点已处于终态（如已取消）时，迟到结果不得覆盖。
+
+        返回 True 表示本次写入生效；False 表示记录已定格，调用方应改记后续信息。
+        """
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT status FROM node_runs WHERE execution_id=? AND node_id=? AND attempt=?",
+                (execution_id, node_id, attempt),
+            ).fetchone()
+            if row is not None and row[0] in self.NODE_TERMINAL_STATUSES:
+                return False
+            self._conn.execute(
+                "UPDATE node_runs SET status=?, detail=?, finished_at=datetime('now') "
+                "WHERE execution_id=? AND node_id=? AND attempt=?",
+                (status, detail, execution_id, node_id, attempt),
+            )
+            return True
+
+    def add_node_followup(
+        self, execution_id: str, node_id: str, attempt: int, kind: str,
+        outcome: str, detail: str | None = None,
+    ) -> None:
+        """记录迟到结果/收尾情况等可追溯的后续信息，不改变节点终态。"""
         with self._lock, self._conn:
             self._conn.execute(
-                "UPDATE executions SET status=?, updated_at=datetime('now') WHERE id=?",
-                (status, execution_id),
+                "INSERT INTO node_followups(execution_id,node_id,attempt,kind,outcome,detail) "
+                "VALUES(?,?,?,?,?,?)",
+                (execution_id, node_id, attempt, kind, outcome, detail),
             )
+
+    def get_node_followups(self, execution_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT node_id,attempt,kind,outcome,detail,created_at "
+                "FROM node_followups WHERE execution_id=? ORDER BY id",
+                (execution_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def start_node_run(self, execution_id: str, node_id: str, attempt: int = 1) -> None:
         with self._lock, self._conn:
@@ -191,8 +280,10 @@ class Store:
             ).fetchall()
         return {
             "id": er["id"], "flow_id": er["flow_id"], "status": er["status"],
+            "termination_reason": er["termination_reason"],
             "started_at": er["started_at"], "updated_at": er["updated_at"],
             "node_runs": [dict(r) for r in nr],
+            "followups": self.get_node_followups(execution_id),
         }
 
     def list_executions(self) -> list[dict[str, Any]]:

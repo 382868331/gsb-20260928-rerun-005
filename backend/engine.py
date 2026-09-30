@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import uuid
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
 
 from .simulator import ActionCancelled, ActionFailed, VirtualRobot
@@ -27,6 +28,11 @@ class Execution:
     manual_resolution: asyncio.Event = field(default_factory=asyncio.Event)
     manual_abort: bool = False
     attempts: dict[str, int] = field(default_factory=dict)
+    cancel_phase: str | None = None  # 取消发生时所处阶段：等待/重试回路/失败收尾/动作收尾
+    final_status: str | None = None
+    termination_reason: str | None = None
+    cleanup_active: bool = False  # 是否正在执行失败收尾流程
+    in_retry_loop: bool = False  # 是否已进入过失败回路
 
     def next_node(self, node_id: str, kind: str) -> str | None:
         for edge in self.definition.get("edges", []):
@@ -174,8 +180,31 @@ class Engine:
                            data={"attempt": attempt})
                 outcome = await self._execute_node(execution, node, attempt)
                 kind, detail = outcome
+                # 动作本身跑完了，但取消决定已在结果到达前生效：
+                # 节点记录必须定格在 cancelled，迟到结果只作为可追溯的后续信息。
+                if kind in ("success", "failure") and execution.stop.is_set():
+                    if execution.cancel_phase is None:
+                        execution.cancel_phase = "重试回路" if execution.in_retry_loop else "动作收尾"
+                    stored = self.store.node_run_status(eid, current, attempt)
+                    self.store.finish_node_run_guarded(
+                        eid, current, attempt, "cancelled", "取消决定已生效，等待动作收尾")
+                    self.store.add_node_followup(
+                        eid, current, attempt, "late_result", kind, detail)
+                    if stored != "cancelled":
+                        self._emit(eid, "node_cancelled", current,
+                                   f"第 {attempt} 次动作收尾后取消：{detail}",
+                                   data={"attempt": attempt})
+                    self._emit(eid, "late_result_recorded", current,
+                               f"迟到结果（{kind}）仅作追溯，不改变取消状态：{detail}",
+                               data={"attempt": attempt, "outcome": kind,
+                                     "detail": detail})
+                    final_status = "cancelled"
+                    break
                 if kind == "cancelled":
-                    self.store.finish_node_run(eid, current, attempt, "cancelled", detail)
+                    if execution.cancel_phase is None:
+                        execution.cancel_phase = "重试回路" if execution.in_retry_loop else "动作收尾"
+                    self.store.finish_node_run_guarded(
+                        eid, current, attempt, "cancelled", detail)
                     self._emit(eid, "node_cancelled", current,
                                f"第 {attempt} 次动作收尾后取消：{detail}",
                                data={"attempt": attempt})
@@ -183,11 +212,25 @@ class Engine:
                     break
                 if kind == "failure":
                     max_retries = int(node.get("params", {}).get("max_retries", 3))
-                    self.store.finish_node_run(eid, current, attempt, "failed", detail)
+                    failure_detail = detail
+                    self.store.finish_node_run(eid, current, attempt, "failed", failure_detail)
                     self._emit(eid, "node_failed", current,
-                               f"第 {attempt}/{max_retries + 1} 次失败：{detail}",
-                               data={"detail": detail, "attempt": attempt,
+                               f"第 {attempt}/{max_retries + 1} 次失败：{failure_detail}",
+                               data={"detail": failure_detail, "attempt": attempt,
                                      "max_retries": max_retries})
+                    # 失败后先走收尾流程（放下持有物 → 返回安全位置）。
+                    # 收尾自身的成功/失败/取消只作为可追溯信息，
+                    # 绝不覆盖本次失败原因，也不改变重试/分支决定。
+                    cancelled_in_cleanup = await self._run_failure_cleanup(
+                        execution, node, attempt, failure_detail)
+                    if execution.stop.is_set() or cancelled_in_cleanup:
+                        execution.cancel_phase = "失败收尾"
+                        self._emit(
+                            eid, "node_cancelled", current,
+                            f"失败收尾期间取消；原失败原因保留：{failure_detail}",
+                            data={"attempt": attempt, "failure_detail": failure_detail})
+                        final_status = "cancelled"
+                        break
                     if attempt > max_retries:
                         target = execution.next_node(current, "exhausted")
                         if target is None:
@@ -210,6 +253,7 @@ class Engine:
                                f"{nodes[target].get('label') or target}",
                                data={"edge": "failure", "target": target,
                                      "attempt": attempt})
+                    execution.in_retry_loop = True
                     current = target
                     continue
                 self.store.finish_node_run(eid, current, attempt, "succeeded", detail)
@@ -225,16 +269,144 @@ class Engine:
                 current = target
             execution.current_node = None
             execution.current_attempt = 0
-            self._set_status(eid, final_status)
+            reason = self._termination_reason(execution, final_status)
+            self.store.set_execution_status(eid, final_status, reason)
+            execution.final_status = final_status
+            execution.termination_reason = reason
             self._emit(eid, "execution_finished",
                        message=f"任务结束：{final_status}",
-                       data={"status": final_status, "robot": self.robot.status()})
+                       data={"status": final_status, "reason": reason,
+                             "robot": self.robot.status()})
         except Exception as exc:  # 兜底：引擎异常也要落库，不留幽灵运行态
-            self._set_status(eid, "failed")
+            reason = f"引擎异常：{exc}"
+            self.store.set_execution_status(eid, "failed", reason)
             self._emit(eid, "execution_finished", message=f"引擎异常：{exc}",
-                       data={"status": "failed"})
+                       data={"status": "failed", "reason": reason})
         finally:
             self._executions.pop(eid, None)
+
+    def _termination_reason(self, execution: Execution, status: str) -> str | None:
+        eid = execution.id
+        if status == "succeeded":
+            return "全部节点执行成功"
+        if status == "cancelled":
+            # 取消若发生在失败收尾阶段，原失败原因必须保留在终止说明中
+            last_failure = None
+            for nr in reversed(self.store.get_execution(eid)["node_runs"]):
+                if nr["status"] == "failed":
+                    last_failure = f"节点 {nr['node_id']} 第 {nr['attempt']} 次失败：{nr['detail']}"
+                    break
+            phase = execution.cancel_phase or "动作"
+            if last_failure:
+                return f"取消于{phase}；{last_failure}"
+            return f"取消于{phase}：取消时已确定的节点状态保持不变，迟到结果仅作追溯"
+        if status == "failed":
+            return "节点失败且无后续分支"
+        if status == "resolved":
+            return "人工确认终止"
+        return None
+
+    async def _run_failure_cleanup(
+        self, execution: Execution, failed_node: dict, attempt: int,
+        failure_detail: str | None,
+    ) -> bool:
+        """失败后的收尾流程：就地放下持有物 → 返回安全位置。
+
+        取消语义：
+        - 取消发生在重试/等待过程中（进入收尾前 stop 已置位）：不启动任何收尾动作；
+        - 取消发生在收尾过程中：允许当前正在执行的那一个收尾动作做完，
+          不再启动后续收尾动作；再次到达的取消（stop 已存在）立即终止下一个动作；
+        - 收尾自身失败或被取消，只记为该失败节点的可追溯后续信息，
+          原失败原因与分支决定不变。
+
+        返回 True 表示收尾过程被取消（流程应停止，不再进入重试分支）。
+        """
+        eid = execution.id
+        node_id = failed_node["id"]
+
+        async def cleanup_progress(data: dict) -> None:
+            self._emit(eid, "cleanup_progress", node_id, data={**data, "attempt": attempt})
+
+        async def gate_steps() -> None:
+            await self._gate(execution)
+
+        # 收尾流程定义：放下持有物 → 返回安全位置。暂停仍然生效。
+        stop = execution.stop
+        stages: list[tuple[str, Awaitable[object], str]] = [
+            ("release", self.robot.release_if_holding(
+                cleanup_progress, stop, gate_steps), "放下持有物"),
+            ("return", self.robot.return_to_safe(
+                cleanup_progress, stop, gate_steps), "返回安全位置"),
+        ]
+        self._emit(eid, "cleanup_started", node_id,
+                   f"第 {attempt} 次失败后开始收尾：放下持有物 → 返回安全位置；"
+                   f"原失败原因：{failure_detail}",
+                   data={"attempt": attempt, "failure_detail": failure_detail})
+        cancelled = False
+        for idx, (stage, coro, label) in enumerate(stages):
+            await self._gate(execution)
+            # idx==0 且 stop 未置位：正常启动收尾。
+            # idx==0 且 stop 已置位：取消发生在重试/等待阶段（收尾从未开始），不启动收尾。
+            # idx>0 且 stop 已置位：取消发生在收尾过程中；当前动作由 simulator 允许做完，
+            #   后续收尾动作在此处不再启动。
+            if stop.is_set():
+                if idx == 0:
+                    skip_detail = f"收尾未启动（取消于重试/等待阶段），跳过：{label}"
+                    skip_message = (f"取消已在收尾前生效，收尾动作 {label} 不再启动；"
+                                    f"原失败原因保留：{failure_detail}")
+                else:
+                    skip_detail = f"收尾中途取消，后续动作不再启动：{label}"
+                    skip_message = (f"收尾中途取消，{label} 不再启动；"
+                                    f"原失败原因保留：{failure_detail}")
+                self.store.add_node_followup(
+                    eid, node_id, attempt, "cleanup", "cancelled", skip_detail)
+                self._emit(eid, "cleanup_skipped", node_id, skip_message,
+                           data={"attempt": attempt, "stage": stage})
+                cancelled = True
+                break
+            execution.cleanup_active = True
+            try:
+                result = await coro
+            except ActionCancelled as exc:
+                self.store.add_node_followup(
+                    eid, node_id, attempt, "cleanup", "cancelled", f"{label}：{exc}")
+                self._emit(eid, "cleanup_cancelled", node_id,
+                           f"收尾动作 {label} 被取消；原失败原因保留：{failure_detail}",
+                           data={"attempt": attempt, "stage": stage})
+                cancelled = True
+                break
+            except ActionFailed as exc:
+                self.store.add_node_followup(
+                    eid, node_id, attempt, "cleanup", "failed", f"{label}：{exc}")
+                self._emit(eid, "cleanup_failed", node_id,
+                           f"收尾动作 {label} 失败：{exc}；原失败原因保留：{failure_detail}",
+                           data={"attempt": attempt, "stage": stage, "detail": str(exc)})
+                continue
+            if stage == "release" and not result:
+                self.store.add_node_followup(
+                    eid, node_id, attempt, "cleanup", "noop", "机械爪为空，无需放下")
+                if stop.is_set():
+                    self.store.add_node_followup(
+                        eid, node_id, attempt, "cleanup", "cancelled",
+                        "收尾中途取消，后续动作不再启动：返回安全位置")
+                    self._emit(eid, "cleanup_skipped", node_id,
+                               f"收尾中途取消，返回安全位置不再启动；"
+                               f"原失败原因保留：{failure_detail}",
+                               data={"attempt": attempt, "stage": "return"})
+                    cancelled = True
+                    break
+                continue
+            if stage == "return":
+                sx, sy = result  # type: ignore[misc]
+                self.store.add_node_followup(
+                    eid, node_id, attempt, "cleanup", "succeeded",
+                    f"已返回安全位置 ({sx:g}, {sy:g})")
+                self._emit(eid, "cleanup_succeeded", node_id,
+                           f"收尾完成，已返回安全位置 ({sx:g}, {sy:g})；"
+                           f"原失败原因保留：{failure_detail}",
+                           data={"attempt": attempt, "safe": [sx, sy]})
+        execution.cleanup_active = False
+        return cancelled
 
     async def _run_manual_node(self, execution: Execution, node: dict) -> str | None:
         """人工处置节点：停在明确位置，等待人工确认继续或终止。"""
@@ -298,7 +470,8 @@ class Engine:
                 while True:
                     await self._gate(execution)
                     if execution.stop.is_set():
-                        return "cancelled", "等待被取消"
+                        execution.cancel_phase = "等待条件"
+                        return "cancelled", "等待期间被取消"
                     if execution.paused:
                         continue
                     remaining = None if deadline is None else max(0.0, deadline - asyncio.get_running_loop().time())
@@ -310,7 +483,8 @@ class Engine:
                             return "failure", f"等待 {condition} 超时"
                         continue
                     if execution.stop.is_set():
-                        return "cancelled", "等待被取消"
+                        execution.cancel_phase = "等待条件"
+                        return "cancelled", "等待期间被取消"
                     self._set_status(eid, "running")
                     return "success", f"条件 {condition} 已满足"
             finally:

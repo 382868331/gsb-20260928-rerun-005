@@ -8,7 +8,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 
 from .engine import Engine
-from .schemas import FlowIn, ManualResolveIn, ObstacleIn
+from .schemas import FlowIn, LateFinishIn, ManualResolveIn, ObstacleIn
 from .simulator import VirtualRobot
 from .store import Store
 
@@ -161,6 +161,13 @@ async def robot_status():
 async def set_obstacle(payload: ObstacleIn):
     app.state.robot.set_obstacle(payload.present)
     return {"obstacle": payload.present}
+
+
+@app.post("/api/robot/late-finish")
+async def set_late_finish(payload: LateFinishIn):
+    """模拟真实设备：取消后尚未返回的动作稍后才报告成功（迟到结果场景）。"""
+    app.state.robot.set_late_finish(payload.enabled)
+    return {"late_finish": payload.enabled}
 
 
 @app.websocket("/ws/events")

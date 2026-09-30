@@ -154,6 +154,9 @@ export default function App() {
               {execution ? STATUS_TEXT[execution.status] ?? execution.status : '未运行'}
             </span>
             {execution && <span>执行 {execution.id}</span>}
+            {execution?.termination_reason && TERMINAL.has(execution.status) && (
+              <span className="termination-reason">{execution.termination_reason}</span>
+            )}
           </div>
           {execution?.status === 'awaiting_manual' && manualNode && (
             <div className="manual-bar">

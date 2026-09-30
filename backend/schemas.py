@@ -43,5 +43,9 @@ class ObstacleIn(BaseModel):
     present: bool
 
 
+class LateFinishIn(BaseModel):
+    enabled: bool = False
+
+
 class ManualResolveIn(BaseModel):
     abort: bool = False

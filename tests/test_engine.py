@@ -224,3 +224,181 @@ async def test_cancel_then_late_result_not_counted(harness):
     assert all(nr["status"] != "succeeded" for nr in runs if nr["node_id"] == "back")
     assert not any(nr["node_id"] == "ok" for nr in runs)
     assert store.get_execution(eid)["status"] == "cancelled"
+
+
+async def test_late_move_success_after_cancel_keeps_cancelled(harness):
+    """取消后尚未返回的移动稍后报告成功：节点保持 cancelled，迟到结果只作追溯。"""
+    store, robot, engine = harness
+    robot.set_late_finish(True)
+    flow = {"nodes": [
+        {"id": "m", "type": "move", "label": "长距离移动", "params": {"x": 8, "y": 0}},
+        {"id": "n", "type": "log", "label": "下一步", "params": {"message": "go"}},
+    ], "edges": [
+        {"id": "1", "source": "m", "target": "n", "kind": "success"},
+    ]}
+    eid = engine.start("flow1", flow)
+    await wait_until(
+        lambda: any(nr["node_id"] == "m" and nr["status"] == "running"
+                    for nr in store.get_execution(eid)["node_runs"]))
+    assert engine.cancel(eid)
+    await wait_until(lambda: store.get_execution(eid)["status"] == "cancelled", timeout=6)
+    # 移动动作稍后才真正跑完并报告成功
+    await asyncio.sleep(1.0)
+
+    record = store.get_execution(eid)
+    assert record["status"] == "cancelled"
+    move_runs = [nr for nr in record["node_runs"] if nr["node_id"] == "m"]
+    assert [nr["status"] for nr in move_runs] == ["cancelled"]
+    assert not any(nr["node_id"] == "n" for nr in record["node_runs"])
+
+    events = store.get_events(eid)
+    assert sum(1 for e in events if e["type"] == "node_succeeded" and e["node_id"] == "m") == 0
+    assert sum(1 for e in events if e["type"] == "execution_finished") == 1
+    late = [e for e in events if e["type"] == "late_result_recorded"]
+    assert len(late) == 1 and late[0]["data"]["outcome"] == "success"
+
+    followups = record["followups"]
+    assert any(f["kind"] == "late_result" and f["outcome"] == "success"
+               and f["node_id"] == "m" for f in followups)
+    reason = record["termination_reason"]
+    assert reason and "取消" in reason
+
+
+CLEANUP_FLOW = {
+    "nodes": [
+        {"id": "m", "type": "move", "label": "移动", "params": {"x": 3, "y": 4}},
+        {"id": "p", "type": "pick", "label": "取物",
+         "params": {"item": "包裹", "max_retries": 0}},
+        {"id": "ok", "type": "log", "label": "成功", "params": {"message": "done"}},
+        {"id": "r", "type": "log", "label": "失败分支", "params": {"message": "fail"}},
+    ],
+    "edges": [
+        {"id": "1", "source": "m", "target": "p", "kind": "success"},
+        {"id": "2", "source": "p", "target": "ok", "kind": "success"},
+        {"id": "3", "source": "p", "target": "r", "kind": "failure"},
+        {"id": "4", "source": "p", "target": "r", "kind": "exhausted"},
+    ],
+}
+
+
+async def test_failure_runs_cleanup_and_keeps_failure_reason(harness):
+    """失败后收尾：放下/返回安全位置执行，节点仍为 failed，原因不被覆盖。"""
+    store, robot, engine = harness
+    robot.set_obstacle(True)
+    eid = engine.start("flow1", CLEANUP_FLOW)
+    await wait_until(lambda: store.get_execution(eid)["status"] == "succeeded", timeout=12)
+
+    record = store.get_execution(eid)
+    pick = [nr for nr in record["node_runs"] if nr["node_id"] == "p"]
+    assert pick[0]["status"] == "failed"
+    assert "障碍" in pick[0]["detail"]
+    # 收尾结束回到安全位置 (0,0)
+    assert (robot.status()["x"], robot.status()["y"]) == (0.0, 0.0)
+    assert robot.status()["idle"] is True
+
+    events = store.get_events(eid)
+    types = [e["type"] for e in events]
+    assert "cleanup_started" in types
+    assert "cleanup_succeeded" in types
+    followups = record["followups"]
+    cleanup = [f for f in followups if f["kind"] == "cleanup"]
+    assert any(f["outcome"] == "succeeded" for f in cleanup)
+    # 失败分支照常推进
+    assert any(e["type"] in ("branch_taken", "retries_exhausted") and e["node_id"] == "p"
+               for e in events)
+    node_runs = {nr["node_id"]: nr["status"] for nr in record["node_runs"]}
+    assert node_runs["r"] == "succeeded"
+    assert "ok" not in node_runs
+
+
+async def test_cancel_during_wait_skips_cleanup(harness):
+    """取消发生在等待条件期间：不启动任何收尾动作，记录为 cancelled。"""
+    store, robot, engine = harness
+    flow = {"nodes": [
+        {"id": "m", "type": "move", "label": "移动", "params": {"x": 2, "y": 2}},
+        {"id": "w", "type": "wait", "label": "等待", "params": {"condition": "ready"}},
+        {"id": "p", "type": "pick", "label": "取物", "params": {"item": "x"}},
+    ], "edges": [
+        {"id": "1", "source": "m", "target": "w", "kind": "success"},
+        {"id": "2", "source": "w", "target": "p", "kind": "success"},
+    ]}
+    eid = engine.start("flow1", flow)
+    await wait_until(lambda: store.get_execution(eid)["status"] == "waiting")
+    assert engine.cancel(eid)
+    await wait_until(lambda: store.get_execution(eid)["status"] == "cancelled")
+    events = store.get_events(eid)
+    assert not any(e["type"].startswith("cleanup") for e in events)
+    reason = store.get_execution(eid)["termination_reason"]
+    assert "等待" in reason
+
+
+async def test_cancel_during_cleanup_keeps_original_failure(harness):
+    """收尾进行中再次取消：当前收尾动作允许做完，原失败原因保留。"""
+    store, robot, engine = harness
+    robot.set_obstacle(True)
+    eid = engine.start("flow1", CLEANUP_FLOW)
+    await wait_until(
+        lambda: any(e["type"] == "cleanup_started"
+                    for e in store.get_events(eid)), timeout=12)
+    assert engine.cancel(eid)
+    await wait_until(lambda: store.get_execution(eid)["status"] == "cancelled", timeout=6)
+
+    record = store.get_execution(eid)
+    pick = [nr for nr in record["node_runs"] if nr["node_id"] == "p"]
+    assert pick[0]["status"] == "failed"
+    assert "障碍" in pick[0]["detail"]
+    reason = record["termination_reason"]
+    assert "失败" in reason and "障碍" in reason
+    followups = record["followups"]
+    cleanup = [f for f in followups if f["kind"] == "cleanup"]
+    assert any(f["outcome"] == "cancelled" for f in cleanup)
+
+
+async def test_persisted_termination_and_recovery(tmp_path):
+    """落库的终止原因/后续信息在重新打开（模拟重启）后保持一致；遗留运行态为 interrupted。"""
+    db = tmp_path / "test.db"
+    store = Store(db)
+    robot = VirtualRobot()
+    engine = Engine(store, robot)
+    robot.set_late_finish(True)
+    flow = {"nodes": [
+        {"id": "m", "type": "move", "label": "移动", "params": {"x": 6, "y": 0}},
+        {"id": "n", "type": "log", "label": "下一步", "params": {"message": "go"}},
+    ], "edges": [
+        {"id": "1", "source": "m", "target": "n", "kind": "success"},
+    ]}
+    eid = engine.start("flow1", flow)
+    await wait_until(
+        lambda: any(nr["node_id"] == "m" and nr["status"] == "running"
+                    for nr in store.get_execution(eid)["node_runs"]))
+    engine.cancel(eid)
+    await wait_until(lambda: store.get_execution(eid)["status"] == "cancelled", timeout=6)
+    await asyncio.sleep(0.8)
+    reason_before = store.get_termination_reason(eid)
+    assert reason_before
+
+    # 模拟后端重启：旧的运行态标记 interrupted；已终止记录与其原因/后续信息保持不变
+    Store(db)  # 重启时仅打开数据库，不影响已终止记录
+    record = store.get_execution(eid)
+    assert record["status"] == "cancelled"
+    assert record["termination_reason"] == reason_before
+    assert any(f["kind"] == "late_result" for f in record["followups"])
+    move_runs = [nr for nr in record["node_runs"] if nr["node_id"] == "m"]
+    assert [nr["status"] for nr in move_runs] == ["cancelled"]
+
+    # 另一个处于 running 的执行在重启（旧进程消失、新引擎构造）后变为 interrupted
+    store2 = Store(db)
+    robot2 = VirtualRobot()
+    engine2 = Engine(store2, robot2)
+    eid2 = engine2.start("flow1", flow)
+    await wait_until(lambda: store2.get_execution(eid2)["status"] == "running")
+    for execution in list(engine2._executions.values()):
+        execution.task.cancel()
+    await asyncio.sleep(0.1)
+    # 新进程启动新引擎：遗留运行态标记为 interrupted，已终止记录不受影响
+    store3 = Store(db)
+    Engine(store3, VirtualRobot())
+    assert store3.get_execution(eid2)["status"] == "interrupted"
+    assert store3.get_execution(eid)["status"] == "cancelled"
+    for execution in list(engine._executions.values()):
+        execution.task.cancel()
