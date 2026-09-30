@@ -18,6 +18,12 @@ export const api = {
   cancel: (id: string) => req(`/api/executions/${id}/cancel`, { method: 'POST' }),
   signal: (id: string, condition: string) =>
     req(`/api/executions/${id}/signal?condition=${encodeURIComponent(condition)}`, { method: 'POST' }),
+  resolveManual: (id: string, abort: boolean) =>
+    req(`/api/executions/${id}/manual`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ abort }),
+    }),
   setObstacle: (present: boolean) =>
     req('/api/robot/obstacle', {
       method: 'POST',

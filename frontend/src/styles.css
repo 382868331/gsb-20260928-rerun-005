@@ -39,6 +39,17 @@
 .badge-failed { background: #b91c1c; }
 .badge-cancelled { background: #525252; }
 .badge-interrupted { background: #7c2d12; }
+.badge-awaiting_manual { background: #9333ea; }
+.badge-resolved { background: #6b21a8; }
+
+.manual-bar {
+  display: flex; align-items: center; gap: 10px; padding: 8px 16px;
+  background: #faf5ff; border-bottom: 1px solid #e9d5ff; font-size: 13px; color: #6b21a8;
+}
+.manual-bar__title { font-weight: 600; margin-right: auto; }
+.manual-bar button { border-radius: 6px; padding: 5px 12px; font-size: 12px; cursor: pointer; border: 1px solid; }
+.manual-bar .btn-primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+.manual-bar .btn-danger { background: #b91c1c; border-color: #b91c1c; color: #fff; }
 
 .sidebar { width: 360px; border-left: 1px solid #e5e7eb; display: flex; flex-direction: column; }
 .panel { padding: 14px 16px; border-bottom: 1px solid #e5e7eb; }
@@ -52,8 +63,11 @@
 .event-node { margin-left: auto; background: #f3f4f6; padding: 1px 6px; border-radius: 4px; color: #4b5563; font-family: monospace; }
 .event-node_failed .event-msg, .event-node_cancelled .event-msg { color: #b91c1c; }
 .event-branch_taken .event-msg { color: #c2410c; }
+.event-retries_exhausted .event-msg { color: #9333ea; font-weight: 600; }
+.event-node_manual_required .event-msg { color: #9333ea; font-weight: 600; }
 .event-node_waiting .event-msg { color: #a16207; }
 .event-node_succeeded .event-msg { color: #15803d; }
+.event-attempt { color: #6b7280; font-size: 11px; }
 .muted { color: #9ca3af; }
 
 .task-node {
@@ -70,6 +84,16 @@
 .task-node.succeeded { border-color: #15803d; background: #f0fdf4; }
 .task-node.failed { border-color: #dc2626; background: #fef2f2; }
 .task-node.cancelled { border-color: #737373; background: #f5f5f5; opacity: .85; }
+.task-node.manual, .task-node.aborted { border-color: #9333ea; background: #faf5ff; }
+.task-node.manual .task-node__status { color: #7e22ce; }
+.task-node__history { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 5px; }
+.attempt-chip {
+  font-size: 10px; padding: 1px 5px; border-radius: 999px;
+  background: #f3f4f6; color: #6b7280; border: 1px solid #e5e7eb;
+}
+.attempt-chip.attempt-failed { background: #fee2e2; color: #991b1b; border-color: #fecaca; }
+.attempt-chip.attempt-cancelled { background: #f5f5f5; color: #525252; }
+.attempt-chip.attempt-succeeded { background: #dcfce7; color: #166534; border-color: #bbf7d0; }
 .task-node.failed .task-node__status { color: #b91c1c; }
 .task-node.succeeded .task-node__status { color: #15803d; }
 .task-node.waiting .task-node__status { color: #a16207; }
@@ -78,4 +102,5 @@
 @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(202,138,4,.35);} 50% { box-shadow: 0 0 0 6px rgba(202,138,4,0);} }
 
 .edge-failure { stroke-dasharray: 6 4; }
+.edge-exhausted { stroke-dasharray: 2 3; }
 .react-flow__edge.edge-failure path { stroke: #e5484d; }

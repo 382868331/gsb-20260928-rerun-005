@@ -124,3 +124,103 @@ async def test_pause_resume_keeps_state(harness):
     assert engine.resume_execution(eid)
     await wait_until(lambda: store.get_execution(eid)["status"] == "succeeded")
     assert (robot.status()["x"], robot.status()["y"]) == (6.0, 0.0)
+
+
+RETRY_FLOW = {
+    "nodes": [
+        {"id": "s", "type": "log", "label": "出发", "params": {"message": "go"}},
+        {"id": "m", "type": "move", "label": "移动到货架", "params": {"x": 2, "y": 0}},
+        {"id": "p", "type": "pick", "label": "取物",
+         "params": {"item": "包裹", "max_retries": 2}},
+        {"id": "r", "type": "log", "label": "绕行播报", "params": {"message": "重试中"}},
+        {"id": "back", "type": "move", "label": "回到移动节点", "params": {"x": 2, "y": 0}},
+        {"id": "h", "type": "manual", "label": "人工排障",
+         "params": {"instruction": "请现场处理"}},
+        {"id": "ok", "type": "log", "label": "送达", "params": {"message": "done"}},
+    ],
+    "edges": [
+        {"id": "0", "source": "s", "target": "m", "kind": "success"},
+        {"id": "1", "source": "m", "target": "p", "kind": "success"},
+        {"id": "2", "source": "p", "target": "ok", "kind": "success"},
+        {"id": "3", "source": "p", "target": "r", "kind": "failure"},
+        {"id": "4", "source": "r", "target": "back", "kind": "success"},
+        {"id": "5", "source": "back", "target": "m", "kind": "success"},
+        {"id": "6", "source": "p", "target": "h", "kind": "exhausted"},
+        {"id": "7", "source": "h", "target": "ok", "kind": "success"},
+    ],
+}
+
+
+async def test_consecutive_failures_stop_at_manual(harness):
+    """连续失败达到上限：停在人工处置节点，node_runs 保留每一轮记录。"""
+    store, robot, engine = harness
+    robot.set_obstacle(True)
+    eid = engine.start("flow1", RETRY_FLOW)
+    await wait_until(lambda: store.get_execution(eid)["status"] == "awaiting_manual", timeout=12)
+
+    assert engine.get(eid).manual_node == "h"
+    runs = store.get_execution(eid)["node_runs"]
+    pick_runs = [nr for nr in runs if nr["node_id"] == "p"]
+    assert [(nr["attempt"], nr["status"]) for nr in pick_runs] == [
+        (1, "failed"), (2, "failed"), (3, "failed")]
+    assert sum(1 for e in store.get_events(eid) if e["type"] == "branch_taken") == 2
+    exhausted = [e for e in store.get_events(eid) if e["type"] == "retries_exhausted"]
+    assert len(exhausted) == 1 and exhausted[0]["data"]["target"] == "h"
+    manual_runs = [nr for nr in runs if nr["node_id"] == "h"]
+    assert manual_runs[0]["status"] == "manual"
+
+    assert engine.resolve_manual(eid, abort=True)
+    await wait_until(lambda: store.get_execution(eid)["status"] == "resolved")
+    final = store.get_execution(eid)
+    assert not any(nr["node_id"] == "ok" for nr in final["node_runs"])
+
+
+async def test_second_attempt_succeeds(harness):
+    """第二次成功：旧失败轮次保留为历史，本次状态为成功，流程继续。"""
+    store, robot, engine = harness
+    robot.set_obstacle(True)
+    eid = engine.start("flow1", RETRY_FLOW)
+    await wait_until(
+        lambda: any(nr["node_id"] == "p" and nr["attempt"] == 1 and nr["status"] == "failed"
+                    for nr in store.get_execution(eid)["node_runs"]))
+    # 第一次失败走回路，第二轮取物前清障
+    robot.set_obstacle(False)
+    await wait_until(lambda: store.get_execution(eid)["status"] == "succeeded")
+
+    runs = store.get_execution(eid)["node_runs"]
+    pick_runs = [nr for nr in runs if nr["node_id"] == "p"]
+    assert [(nr["attempt"], nr["status"]) for nr in pick_runs] == [
+        (1, "failed"), (2, "succeeded")]
+    events = store.get_events(eid)
+    assert any(e["type"] == "branch_taken" and e["data"]["attempt"] == 1
+               for e in events)
+    success = [e for e in events if e["type"] == "node_succeeded" and e["node_id"] == "p"]
+    assert success[0]["data"]["attempt"] == 2
+    assert not any(e["type"] == "retries_exhausted" for e in events)
+
+
+async def test_cancel_then_late_result_not_counted(harness):
+    """回路执行中取消：迟到的步骤结果不写入新一轮，执行保持 cancelled。"""
+    store, robot, engine = harness
+    robot.set_obstacle(True)
+    eid = engine.start("flow1", RETRY_FLOW)
+    await wait_until(
+        lambda: any(nr["node_id"] == "p" and nr["attempt"] == 1 and nr["status"] == "failed"
+                    for nr in store.get_execution(eid)["node_runs"]))
+    await wait_until(
+        lambda: any(nr["node_id"] == "back" and nr["status"] == "running"
+                    for nr in store.get_execution(eid)["node_runs"]))
+    assert engine.cancel(eid)
+    # 即使“迟到结果”此时到达（障碍清除），也不能让旧回路继续/完成新一轮
+    robot.set_obstacle(False)
+    await wait_until(lambda: store.get_execution(eid)["status"] == "cancelled")
+    await asyncio.sleep(0.5)
+
+    runs = store.get_execution(eid)["node_runs"]
+    pick_runs = [nr for nr in runs if nr["node_id"] == "p"]
+    assert [(nr["attempt"], nr["status"]) for nr in pick_runs] == [(1, "failed")]
+    move_runs = [nr for nr in runs if nr["node_id"] == "m"]
+    assert len(move_runs) == 1 and move_runs[0]["status"] == "succeeded"
+    assert all(nr["status"] != "succeeded" for nr in runs if nr["node_id"] == "back")
+    assert not any(nr["node_id"] == "ok" for nr in runs)
+    assert store.get_execution(eid)["status"] == "cancelled"

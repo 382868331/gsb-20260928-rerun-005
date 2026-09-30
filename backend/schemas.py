@@ -5,8 +5,8 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
-NodeType = Literal["move", "pick", "place", "wait", "log"]
-EdgeKind = Literal["success", "failure"]
+NodeType = Literal["move", "pick", "place", "wait", "log", "manual"]
+EdgeKind = Literal["success", "failure", "exhausted"]
 
 
 class FlowNode(BaseModel):
@@ -41,3 +41,7 @@ class FlowIn(BaseModel):
 
 class ObstacleIn(BaseModel):
     present: bool
+
+
+class ManualResolveIn(BaseModel):
+    abort: bool = False

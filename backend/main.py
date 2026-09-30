@@ -8,7 +8,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 
 from .engine import Engine
-from .schemas import FlowIn, ObstacleIn
+from .schemas import FlowIn, ManualResolveIn, ObstacleIn
 from .simulator import VirtualRobot
 from .store import Store
 
@@ -19,11 +19,13 @@ SEED_FLOW = {
         {"id": "n1", "type": "log", "label": "出发播报", "params": {"message": "开始执行取物任务"}},
         {"id": "n2", "type": "move", "label": "移动到货架", "params": {"x": 4, "y": 3}},
         {"id": "n3", "type": "wait", "label": "等待货架绿灯", "params": {"condition": "shelf_ready"}},
-        {"id": "n4", "type": "pick", "label": "取物", "params": {"item": "包裹A"}},
+        {"id": "n4", "type": "pick", "label": "取物", "params": {"item": "包裹A", "max_retries": 2}},
         {"id": "n5", "type": "move", "label": "送到工作台", "params": {"x": 1, "y": 0}},
         {"id": "n6", "type": "place", "label": "放下包裹", "params": {}},
-        {"id": "n7", "type": "log", "label": "绕行重试", "params": {"message": "取物失败，改走备用路径"}},
-        {"id": "n8", "type": "wait", "label": "等待人工排障", "params": {"condition": "manual_clear"}},
+        {"id": "n7", "type": "log", "label": "绕行播报", "params": {"message": "取物失败，改走备用路径重试"}},
+        {"id": "n8", "type": "move", "label": "回到移动节点重试", "params": {"x": 4, "y": 3}},
+        {"id": "n9", "type": "manual", "label": "等待人工排障",
+         "params": {"instruction": "取物连续失败 3 次，请现场排障：清除障碍后放行，或确认终止任务"}},
     ],
     "edges": [
         {"id": "e1", "source": "n1", "target": "n2", "kind": "success"},
@@ -34,6 +36,7 @@ SEED_FLOW = {
         {"id": "e6", "source": "n4", "target": "n7", "kind": "failure"},
         {"id": "e7", "source": "n7", "target": "n8", "kind": "success"},
         {"id": "e8", "source": "n8", "target": "n2", "kind": "success"},
+        {"id": "e9", "source": "n4", "target": "n9", "kind": "exhausted"},
     ],
 }
 
@@ -43,8 +46,7 @@ async def lifespan(app: FastAPI):
     store = Store(DB_PATH)
     robot = VirtualRobot()
     engine = Engine(store, robot)
-    if not store.list_flows():
-        store.save_flow("fetch-demo", "取物任务（含等待/失败分支）", SEED_FLOW)
+    store.save_flow("fetch-demo", "取物任务（失败回路/有限重试/人工处置）", SEED_FLOW)
     app.state.store = store
     app.state.robot = robot
     app.state.engine = engine
@@ -117,6 +119,13 @@ async def signal_condition(execution_id: str, condition: str = "signal"):
     return {"status": "signalled"}
 
 
+@app.post("/api/executions/{execution_id}/manual")
+async def resolve_manual(execution_id: str, payload: ManualResolveIn):
+    if not app.state.engine.resolve_manual(execution_id, abort=payload.abort):
+        raise HTTPException(409, "当前没有等待人工处置的任务")
+    return {"status": "aborted" if payload.abort else "resolved"}
+
+
 @app.get("/api/executions")
 async def list_executions():
     return app.state.store.list_executions()
@@ -130,6 +139,9 @@ async def get_execution(execution_id: str):
     record["robot"] = app.state.robot.status()
     execution = app.state.engine.get(execution_id)
     record["waiting_for"] = execution.wait_condition if execution else None
+    record["manual_node"] = execution.manual_node if execution else None
+    record["current_node"] = execution.current_node if execution else None
+    record["current_attempt"] = execution.current_attempt if execution else 0
     return record
 
 

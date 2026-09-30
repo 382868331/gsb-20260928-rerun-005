@@ -7,7 +7,7 @@ from .simulator import ActionCancelled, ActionFailed, VirtualRobot
 from .store import Store
 
 
-TERMINAL = {"succeeded", "failed", "cancelled", "interrupted"}
+TERMINAL = {"succeeded", "failed", "cancelled", "interrupted", "resolved"}
 
 
 @dataclass
@@ -21,6 +21,12 @@ class Execution:
     resume: asyncio.Event = field(default_factory=asyncio.Event)
     wait_condition: str | None = None
     condition_met: asyncio.Event = field(default_factory=asyncio.Event)
+    current_node: str | None = None
+    current_attempt: int = 0
+    manual_node: str | None = None
+    manual_resolution: asyncio.Event = field(default_factory=asyncio.Event)
+    manual_abort: bool = False
+    attempts: dict[str, int] = field(default_factory=dict)
 
     def next_node(self, node_id: str, kind: str) -> str | None:
         for edge in self.definition.get("edges", []):
@@ -116,6 +122,14 @@ class Engine:
             return True
         return False
 
+    def resolve_manual(self, execution_id: str, abort: bool = False) -> bool:
+        execution = self._executions.get(execution_id)
+        if not execution or execution.manual_node is None:
+            return False
+        execution.manual_abort = abort
+        execution.manual_resolution.set()
+        return True
+
     async def _gate(self, execution: Execution) -> None:
         while execution.paused and not execution.stop.is_set():
             try:
@@ -140,35 +154,77 @@ class Engine:
                     final_status = "cancelled"
                     break
                 node = nodes[current]
-                self.store.start_node_run(eid, current)
+                if node.get("type") == "manual":
+                    current = await self._run_manual_node(execution, node)
+                    if current is None:
+                        final_status = "resolved"
+                        break
+                    if current == "__cancel__":
+                        final_status = "cancelled"
+                        break
+                    continue
+
+                attempt = execution.attempts.get(current, 0) + 1
+                execution.attempts[current] = attempt
+                execution.current_node = current
+                execution.current_attempt = attempt
+                self.store.start_node_run(eid, current, attempt)
                 self._emit(eid, "node_started", current,
-                           f"开始：{node.get('label') or current}")
-                outcome = await self._execute_node(execution, node)
-                kind, detail, next_kind = outcome
+                           f"第 {attempt} 次开始：{node.get('label') or current}",
+                           data={"attempt": attempt})
+                outcome = await self._execute_node(execution, node, attempt)
+                kind, detail = outcome
                 if kind == "cancelled":
-                    self.store.update_node_run(eid, current, "cancelled", detail, True)
+                    self.store.finish_node_run(eid, current, attempt, "cancelled", detail)
                     self._emit(eid, "node_cancelled", current,
-                               f"动作收尾后取消：{detail}")
+                               f"第 {attempt} 次动作收尾后取消：{detail}",
+                               data={"attempt": attempt})
                     final_status = "cancelled"
                     break
                 if kind == "failure":
-                    self.store.update_node_run(eid, current, "failed", detail, True)
-                    self._emit(eid, "node_failed", current, f"失败：{detail}",
-                               data={"detail": detail})
+                    max_retries = int(node.get("params", {}).get("max_retries", 3))
+                    self.store.finish_node_run(eid, current, attempt, "failed", detail)
+                    self._emit(eid, "node_failed", current,
+                               f"第 {attempt}/{max_retries + 1} 次失败：{detail}",
+                               data={"detail": detail, "attempt": attempt,
+                                     "max_retries": max_retries})
+                    if attempt > max_retries:
+                        target = execution.next_node(current, "exhausted")
+                        if target is None:
+                            target = execution.next_node(current, "failure")
+                        if target is None:
+                            final_status = "failed"
+                            break
+                        self._emit(eid, "retries_exhausted", current,
+                                   f"已达 {max_retries + 1} 次上限，转入："
+                                   f"{nodes[target].get('label') or target}",
+                                   data={"attempt": attempt, "target": target})
+                        current = target
+                        continue
                     target = execution.next_node(current, "failure")
                     if target is None:
                         final_status = "failed"
                         break
                     self._emit(eid, "branch_taken", current,
-                               f"失败后走向：{nodes[target].get('label') or target}",
-                               data={"edge": "failure", "target": target})
+                               f"第 {attempt} 次失败后走向："
+                               f"{nodes[target].get('label') or target}",
+                               data={"edge": "failure", "target": target,
+                                     "attempt": attempt})
                     current = target
                     continue
-                self.store.update_node_run(eid, current, "succeeded", detail, True)
-                self._emit(eid, "node_succeeded", current,
-                           f"完成：{node.get('label') or current}")
+                self.store.finish_node_run(eid, current, attempt, "succeeded", detail)
+                if attempt > 1:
+                    self._emit(eid, "node_succeeded", current,
+                               f"第 {attempt} 次尝试成功：{node.get('label') or current}",
+                               data={"attempt": attempt})
+                else:
+                    self._emit(eid, "node_succeeded", current,
+                               f"完成：{node.get('label') or current}",
+                               data={"attempt": attempt})
                 target = execution.next_node(current, "success")
                 current = target
+            execution.current_node = None
+            execution.current_attempt = 0
             self._set_status(eid, final_status)
             self._emit(eid, "execution_finished",
                        message=f"任务结束：{final_status}",
@@ -180,36 +236,69 @@ class Engine:
         finally:
             self._executions.pop(eid, None)
 
-    async def _execute_node(self, execution: Execution, node: dict) -> tuple[str, str | None, str]:
+    async def _run_manual_node(self, execution: Execution, node: dict) -> str | None:
+        """人工处置节点：停在明确位置，等待人工确认继续或终止。"""
+        eid = execution.id
+        node_id = node["id"]
+        execution.manual_node = node_id
+        execution.manual_abort = False
+        execution.manual_resolution.clear()
+        instruction = node.get("params", {}).get("instruction", "等待人工处置")
+        self.store.start_node_run(eid, node_id, 1)
+        self.store.update_node_run(eid, node_id, 1, "manual", instruction)
+        self._set_status(eid, "awaiting_manual")
+        self._emit(eid, "node_manual_required", node_id,
+                   f"停在人工处置节点：{node.get('label') or node_id}（{instruction}）",
+                   data={"instruction": instruction})
+        while not execution.manual_resolution.is_set() and not execution.stop.is_set():
+            try:
+                await asyncio.wait_for(execution.manual_resolution.wait(), timeout=0.2)
+            except asyncio.TimeoutError:
+                pass
+        execution.manual_node = None
+        if execution.stop.is_set():
+            self.store.finish_node_run(eid, node_id, 1, "cancelled", "等待处置期间被取消")
+            self._emit(eid, "node_cancelled", node_id, "人工处置节点被取消")
+            return "__cancel__"
+        if execution.manual_abort:
+            self.store.finish_node_run(eid, node_id, 1, "aborted", "人工终止流程")
+            self._emit(eid, "node_manual_aborted", node_id, "人工确认终止，流程停在此处")
+            return None
+        self.store.finish_node_run(eid, node_id, 1, "succeeded", "人工处置完成，继续执行")
+        self._emit(eid, "node_manual_resolved", node_id, "人工处置完成，流程继续")
+        return execution.next_node(node_id, "success")
+
+    async def _execute_node(self, execution: Execution, node: dict, attempt: int = 1) -> tuple[str, str | None]:
         eid = execution.id
         ntype = node["type"]
         params = node.get("params", {})
 
         async def progress(data: dict) -> None:
             self._emit(eid, "node_progress", node["id"],
-                       data={**data, "robot": self.robot.status()})
+                       data={**data, "attempt": attempt, "robot": self.robot.status()})
 
         if ntype == "log":
             message = str(params.get("message", ""))
-            self._emit(eid, "node_log", node["id"], message)
-            return "success", message, "success"
+            self._emit(eid, "node_log", node["id"], message, data={"attempt": attempt})
+            return "success", message
 
         if ntype == "wait":
             condition = params.get("condition", "signal")
             timeout = params.get("timeout")
             execution.wait_condition = condition
             execution.condition_met.clear()
-            self.store.update_node_run(eid, node["id"], "waiting",
-                                       f"等待条件：{condition}")
+            self.store.mark_node_run_waiting(eid, node["id"], attempt,
+                                             f"等待条件：{condition}")
             self._emit(eid, "node_waiting", node["id"],
-                       f"等待条件：{condition}")
+                       f"第 {attempt} 次等待条件：{condition}",
+                       data={"attempt": attempt})
             self._set_status(eid, "waiting")
             try:
                 deadline = asyncio.get_running_loop().time() + float(timeout) if timeout else None
                 while True:
                     await self._gate(execution)
                     if execution.stop.is_set():
-                        return "cancelled", "等待被取消", ""
+                        return "cancelled", "等待被取消"
                     if execution.paused:
                         continue
                     remaining = None if deadline is None else max(0.0, deadline - asyncio.get_running_loop().time())
@@ -218,12 +307,12 @@ class Engine:
                                                timeout=remaining if remaining is not None else 0.2)
                     except asyncio.TimeoutError:
                         if deadline is not None and asyncio.get_running_loop().time() >= deadline:
-                            return "failure", f"等待 {condition} 超时", "failure"
+                            return "failure", f"等待 {condition} 超时"
                         continue
                     if execution.stop.is_set():
-                        return "cancelled", "等待被取消", ""
+                        return "cancelled", "等待被取消"
                     self._set_status(eid, "running")
-                    return "success", f"条件 {condition} 已满足", "success"
+                    return "success", f"条件 {condition} 已满足"
             finally:
                 execution.wait_condition = None
 
@@ -235,15 +324,15 @@ class Engine:
             if ntype == "move":
                 await self.robot.move(float(params.get("x", 0)), float(params.get("y", 0)),
                                      progress, stop, gate_steps)
-                return "success", "移动完成", "success"
+                return "success", "移动完成"
             if ntype == "pick":
                 await self.robot.pick(str(params.get("item", "物品")), progress, stop, gate_steps)
-                return "success", "取物完成", "success"
+                return "success", "取物完成"
             if ntype == "place":
                 await self.robot.place(progress, stop, gate_steps)
-                return "success", "放置完成", "success"
-            return "failure", f"未知节点类型：{ntype}", "failure"
+                return "success", "放置完成"
+            return "failure", f"未知节点类型：{ntype}"
         except ActionCancelled as exc:
-            return "cancelled", str(exc), ""
+            return "cancelled", str(exc)
         except ActionFailed as exc:
-            return "failure", str(exc), "failure"
+            return "failure", str(exc)

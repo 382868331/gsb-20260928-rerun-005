@@ -8,9 +8,11 @@ const STATUS_TEXT: Record<string, string> = {
   waiting: '等待条件',
   paused: '已暂停',
   cancelling: '取消中（动作收尾）',
+  awaiting_manual: '等待人工处置',
   succeeded: '成功',
   failed: '失败',
   cancelled: '已取消',
+  resolved: '已人工终止',
   interrupted: '中断',
 };
 
@@ -106,6 +108,10 @@ export default function App() {
   }
 
   const waitingCondition = execution?.waiting_for;
+  const manualNodeId = execution?.manual_node;
+  const manualNode = manualNodeId
+    ? flow?.definition.nodes.find((n) => n.id === manualNodeId) ?? null
+    : null;
 
   return (
     <div className="app">
@@ -119,7 +125,7 @@ export default function App() {
         <button onClick={start} disabled={!flowId || !!active} className="btn-primary">▶ 运行</button>
         <button
           onClick={() => runAction(() => api.pause(execution!.id))}
-          disabled={!active || execution?.status !== 'running'}
+          disabled={!active || (execution?.status !== 'running' && execution?.status !== 'waiting')}
         >⏸ 暂停</button>
         <button
           onClick={() => runAction(() => api.resume(execution!.id))}
@@ -133,7 +139,7 @@ export default function App() {
         <button onClick={toggleObstacle} className={obstacle ? 'btn-warn active' : 'btn-warn'}>
           {obstacle ? '🚧 障碍物：开' : '🚧 障碍物：关'}
         </button>
-        {waitingCondition && (
+        {waitingCondition && execution?.status !== 'paused' && (
           <button
             className="btn-primary"
             onClick={() => runAction(() => api.signal(execution!.id, waitingCondition))}
@@ -149,11 +155,25 @@ export default function App() {
             </span>
             {execution && <span>执行 {execution.id}</span>}
           </div>
+          {execution?.status === 'awaiting_manual' && manualNode && (
+            <div className="manual-bar">
+              <span className="manual-bar__title">✋ {manualNode.label}：{String(manualNode.params.instruction ?? '等待人工处置')}</span>
+              <button
+                className="btn-primary"
+                onClick={() => runAction(() => api.resolveManual(execution.id, false))}
+              >已排障，放行继续</button>
+              <button
+                className="btn-danger"
+                onClick={() => runAction(() => api.resolveManual(execution.id, true))}
+              >确认终止，流程停在此处</button>
+            </div>
+          )}
           {flow && (
             <FlowCanvas
               nodes={flow.definition.nodes}
               edges={flow.definition.edges}
               execution={execution}
+              events={events}
             />
           )}
         </section>
@@ -175,6 +195,9 @@ export default function App() {
                 <li key={event.seq} className={`event event-${event.type}`}>
                   <span className="event-seq">#{event.seq}</span>
                   <span className="event-msg">{event.message ?? event.type}</span>
+                  {event.data?.attempt ? (
+                    <span className="event-attempt">第{String(event.data.attempt)}次</span>
+                  ) : null}
                   {event.node_id && <span className="event-node">{event.node_id}</span>}
                 </li>
               ))}

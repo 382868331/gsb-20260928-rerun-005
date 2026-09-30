@@ -110,27 +110,35 @@ class Store:
             )
 
     def finish_node_run(
-        self, execution_id: str, node_id: str, status: str, detail: str | None = None
+        self, execution_id: str, node_id: str, attempt: int, status: str,
+        detail: str | None = None,
     ) -> None:
         with self._lock, self._conn:
             self._conn.execute(
                 "UPDATE node_runs SET status=?, detail=?, finished_at=datetime('now') "
-                "WHERE id=(SELECT id FROM node_runs WHERE execution_id=? AND node_id=? "
-                "ORDER BY id DESC LIMIT 1)",
-                (status, detail, execution_id, node_id),
+                "WHERE execution_id=? AND node_id=? AND attempt=?",
+                (status, detail, execution_id, node_id, attempt),
+            )
+
+    def mark_node_run_waiting(
+        self, execution_id: str, node_id: str, attempt: int, detail: str | None = None,
+    ) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE node_runs SET status=?, detail=? "
+                "WHERE execution_id=? AND node_id=? AND attempt=?",
+                ("waiting", detail, execution_id, node_id, attempt),
             )
 
     def update_node_run(
-        self, execution_id: str, node_id: str, status: str, detail: str | None = None,
-        finish: bool = False,
+        self, execution_id: str, node_id: str, attempt: int, status: str,
+        detail: str | None = None,
     ) -> None:
-        finished = ", finished_at=datetime('now')" if finish else ""
         with self._lock, self._conn:
             self._conn.execute(
-                f"UPDATE node_runs SET status=?, detail=?{finished} "
-                "WHERE id=(SELECT id FROM node_runs WHERE execution_id=? AND node_id=? "
-                "ORDER BY id DESC LIMIT 1)",
-                (status, detail, execution_id, node_id),
+                "UPDATE node_runs SET status=?, detail=? "
+                "WHERE execution_id=? AND node_id=? AND attempt=?",
+                (status, detail, execution_id, node_id, attempt),
             )
 
     def add_event(
@@ -200,5 +208,5 @@ class Store:
         with self._lock, self._conn:
             self._conn.execute(
                 "UPDATE executions SET status='interrupted' "
-                "WHERE status IN ('running','pausing','waiting','cancelling')"
+                "WHERE status IN ('running','paused','waiting','cancelling','awaiting_manual')"
             )
