@@ -35,6 +35,7 @@ export interface Execution {
   id: string;
   flow_id: string;
   status: string;
+  termination_reason?: string | null;
   node_runs: NodeRun[];
   waiting_for: string | null;
   manual_node?: string | null;

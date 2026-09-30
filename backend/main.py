@@ -19,7 +19,8 @@ SEED_FLOW = {
         {"id": "n1", "type": "log", "label": "出发播报", "params": {"message": "开始执行取物任务"}},
         {"id": "n2", "type": "move", "label": "移动到货架", "params": {"x": 4, "y": 3}},
         {"id": "n3", "type": "wait", "label": "等待货架绿灯", "params": {"condition": "shelf_ready"}},
-        {"id": "n4", "type": "pick", "label": "取物", "params": {"item": "包裹A", "max_retries": 2}},
+        {"id": "n4", "type": "pick", "label": "取物",
+         "params": {"item": "包裹A", "max_retries": 2, "safe_point": [0, 0]}},
         {"id": "n5", "type": "move", "label": "送到工作台", "params": {"x": 1, "y": 0}},
         {"id": "n6", "type": "place", "label": "放下包裹", "params": {}},
         {"id": "n7", "type": "log", "label": "绕行播报", "params": {"message": "取物失败，改走备用路径重试"}},
@@ -87,6 +88,7 @@ async def start_run(flow_id: str):
     if flow is None:
         raise HTTPException(404, "流程不存在")
     app.state.robot.set_obstacle(False)
+    app.state.robot.set_cleanup_blocked(False)
     execution_id = app.state.engine.start(flow_id, flow["definition"])
     return {"execution_id": execution_id}
 

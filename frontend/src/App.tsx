@@ -8,6 +8,7 @@ const STATUS_TEXT: Record<string, string> = {
   waiting: '等待条件',
   paused: '已暂停',
   cancelling: '取消中（动作收尾）',
+  cleaning_up: '失败收尾中（返回安全位置）',
   awaiting_manual: '等待人工处置',
   succeeded: '成功',
   failed: '失败',
@@ -154,6 +155,9 @@ export default function App() {
               {execution ? STATUS_TEXT[execution.status] ?? execution.status : '未运行'}
             </span>
             {execution && <span>执行 {execution.id}</span>}
+            {execution?.termination_reason && (
+              <span className="termination-reason">{execution.termination_reason}</span>
+            )}
           </div>
           {execution?.status === 'awaiting_manual' && manualNode && (
             <div className="manual-bar">

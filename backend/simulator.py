@@ -34,13 +34,56 @@ class VirtualRobot:
     def __init__(self) -> None:
         self.state = RobotState()
         self.obstacle = False
+        self.safe_x = 0.0
+        self.safe_y = 0.0
+        self.cleanup_blocked = False
         self._lock = asyncio.Lock()
 
     def set_obstacle(self, present: bool) -> None:
         self.obstacle = present
 
+    def set_safe_point(self, x: float, y: float) -> None:
+        self.safe_x, self.safe_y = float(x), float(y)
+
+    def set_cleanup_blocked(self, blocked: bool) -> None:
+        self.cleanup_blocked = blocked
+
     def status(self) -> dict:
-        return {**self.state.snapshot(), "obstacle": self.obstacle}
+        return {**self.state.snapshot(), "obstacle": self.obstacle,
+                "safe_point": [round(self.safe_x, 2), round(self.safe_y, 2)]}
+
+    async def return_to_safe(
+        self, progress: ProgressCb, stop: asyncio.Event,
+        gate: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        """失败收尾：退回安全位置；不改变失败原因，自身可失败/可取消。"""
+        async with self._lock:
+            tx, ty = self.safe_x, self.safe_y
+            sx, sy = self.state.x, self.state.y
+            if abs(tx - sx) < 1e-9 and abs(ty - sy) < 1e-9:
+                if self.cleanup_blocked:
+                    raise ActionFailed("安全位置受阻，收尾失败")
+                self.state.idle = True
+                return
+            self.state.idle = False
+            steps = max(2, int(abs(tx - sx) + abs(ty - sy)))
+
+            async def report(i: int, total: int) -> None:
+                self.state.x = sx + (tx - sx) * i / total
+                self.state.y = sy + (ty - sy) * i / total
+                await progress({"step": i, "total": total, "phase": "返回安全位置",
+                                **self.state.snapshot()})
+
+            try:
+                await self._steps(steps, 0.2, stop, report, gate)
+            except ActionCancelled:
+                self.state.idle = True
+                raise
+            if self.cleanup_blocked:
+                self.state.idle = True
+                raise ActionFailed("安全位置受阻，收尾失败")
+            self.state.x, self.state.y = tx, ty
+            self.state.idle = True
 
     async def _steps(self, n: int, delay: float, stop: asyncio.Event,
                      on_step: Callable[[int, int], object] | None = None,

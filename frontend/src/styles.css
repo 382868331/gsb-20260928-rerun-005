@@ -35,6 +35,7 @@
 .badge-waiting { background: #ca8a04; }
 .badge-paused { background: #6b7280; }
 .badge-cancelling { background: #c2410c; }
+.badge-cleaning_up { background: #0e7490; }
 .badge-succeeded { background: #15803d; }
 .badge-failed { background: #b91c1c; }
 .badge-cancelled { background: #525252; }
@@ -67,6 +68,10 @@
 .event-node_manual_required .event-msg { color: #9333ea; font-weight: 600; }
 .event-node_waiting .event-msg { color: #a16207; }
 .event-node_succeeded .event-msg { color: #15803d; }
+.event-node_late_action_result .event-msg { color: #0369a1; }
+.event-node_cleanup_failed .event-msg, .event-node_cleanup_cancelled .event-msg { color: #b45309; }
+.event-node_cleanup_finished .event-msg { color: #0e7490; }
+.termination-reason { color: #b45309; font-size: 12px; }
 .event-attempt { color: #6b7280; font-size: 11px; }
 .muted { color: #9ca3af; }
 
