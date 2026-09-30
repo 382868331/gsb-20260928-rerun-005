@@ -22,8 +22,10 @@ SEED_FLOW = {
         {"id": "n4", "type": "pick", "label": "取物", "params": {"item": "包裹A"}},
         {"id": "n5", "type": "move", "label": "送到工作台", "params": {"x": 1, "y": 0}},
         {"id": "n6", "type": "place", "label": "放下包裹", "params": {}},
-        {"id": "n7", "type": "log", "label": "绕行重试", "params": {"message": "取物失败，改走备用路径"}},
-        {"id": "n8", "type": "wait", "label": "等待人工排障", "params": {"condition": "manual_clear"}},
+        {"id": "n7", "type": "log", "label": "绕行播报", "params": {"message": "取物失败，改走备用路径"}},
+        {"id": "n8", "type": "manual", "label": "等待人工排障",
+         "params": {"prompt": "取物失败：排障后重试，或终止任务",
+                     "retry_target": "n2", "max_retries": 2}},
     ],
     "edges": [
         {"id": "e1", "source": "n1", "target": "n2", "kind": "success"},
@@ -33,7 +35,6 @@ SEED_FLOW = {
         {"id": "e5", "source": "n5", "target": "n6", "kind": "success"},
         {"id": "e6", "source": "n4", "target": "n7", "kind": "failure"},
         {"id": "e7", "source": "n7", "target": "n8", "kind": "success"},
-        {"id": "e8", "source": "n8", "target": "n2", "kind": "success"},
     ],
 }
 
@@ -43,8 +44,11 @@ async def lifespan(app: FastAPI):
     store = Store(DB_PATH)
     robot = VirtualRobot()
     engine = Engine(store, robot)
-    if not store.list_flows():
-        store.save_flow("fetch-demo", "取物任务（含等待/失败分支）", SEED_FLOW)
+    existing = {f["id"]: f for f in store.list_flows()}
+    demo = existing.get("fetch-demo")
+    if demo is None or not any(n["type"] == "manual" for n in demo["definition"]["nodes"]):
+        # 老种子含无限等待回路，统一升级为“有限重试 + 人工处置”版本
+        store.save_flow("fetch-demo", "取物任务（含失败回路/有限重试/人工处置）", SEED_FLOW)
     app.state.store = store
     app.state.robot = robot
     app.state.engine = engine
@@ -117,6 +121,14 @@ async def signal_condition(execution_id: str, condition: str = "signal"):
     return {"status": "signalled"}
 
 
+@app.post("/api/executions/{execution_id}/manual")
+async def manual_decision(execution_id: str, action: str):
+    ok, reason = app.state.engine.manual_decide(execution_id, action)
+    if not ok:
+        raise HTTPException(409, reason)
+    return {"status": "accepted", "action": action}
+
+
 @app.get("/api/executions")
 async def list_executions():
     return app.state.store.list_executions()
@@ -130,6 +142,7 @@ async def get_execution(execution_id: str):
     record["robot"] = app.state.robot.status()
     execution = app.state.engine.get(execution_id)
     record["waiting_for"] = execution.wait_condition if execution else None
+    record["manual"] = execution.manual if execution else None
     return record
 
 

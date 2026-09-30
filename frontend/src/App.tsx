@@ -8,6 +8,8 @@ const STATUS_TEXT: Record<string, string> = {
   waiting: '等待条件',
   paused: '已暂停',
   cancelling: '取消中（动作收尾）',
+  manual: '等待人工处置',
+  aborted: '人工终止',
   succeeded: '成功',
   failed: '失败',
   cancelled: '已取消',
@@ -106,6 +108,7 @@ export default function App() {
   }
 
   const waitingCondition = execution?.waiting_for;
+  const manual = execution?.manual ?? null;
 
   return (
     <div className="app">
@@ -138,6 +141,22 @@ export default function App() {
             className="btn-primary"
             onClick={() => runAction(() => api.signal(execution!.id, waitingCondition))}
           >✓ 满足条件：{waitingCondition}</button>
+        )}
+        {manual && (
+          <>
+            <span className="manual-hint" title={manual.detail}>
+              ✋ {manual.detail}（剩余重试 {manual.remaining} 次）
+            </span>
+            <button
+              className="btn-primary"
+              disabled={manual.remaining <= 0 || !manual.retry_target}
+              onClick={() => runAction(() => api.manualDecide(execution!.id, 'retry'))}
+            >↻ 人工处置：重试（回到移动节点）</button>
+            <button
+              className="btn-danger"
+              onClick={() => runAction(() => api.manualDecide(execution!.id, 'abort'))}
+            >⊘ 人工处置：终止</button>
+          </>
         )}
       </header>
       {error && <div className="error-bar">{error}</div>}
@@ -175,7 +194,9 @@ export default function App() {
                 <li key={event.seq} className={`event event-${event.type}`}>
                   <span className="event-seq">#{event.seq}</span>
                   <span className="event-msg">{event.message ?? event.type}</span>
-                  {event.node_id && <span className="event-node">{event.node_id}</span>}
+                  {event.node_id && <span className="event-node">{event.node_id}
+                    {event.data?.attempt != null && ` #${String(event.data.attempt)}`}
+                  </span>}
                 </li>
               ))}
             </ul>

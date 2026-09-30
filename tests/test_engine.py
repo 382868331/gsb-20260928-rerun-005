@@ -124,3 +124,127 @@ async def test_pause_resume_keeps_state(harness):
     assert engine.resume_execution(eid)
     await wait_until(lambda: store.get_execution(eid)["status"] == "succeeded")
     assert (robot.status()["x"], robot.status()["y"]) == (6.0, 0.0)
+
+
+LOOP_FLOW = {
+    "nodes": [
+        {"id": "m", "type": "move", "label": "移动到货架", "params": {"x": 1, "y": 0}},
+        {"id": "p", "type": "pick", "label": "取物", "params": {"item": "包裹"}},
+        {"id": "h", "type": "manual", "label": "人工排障",
+         "params": {"prompt": "取物失败，请处置", "retry_target": "m", "max_retries": 2}},
+        {"id": "ok", "type": "log", "label": "完成播报", "params": {"message": "done"}},
+    ],
+    "edges": [
+        {"id": "1", "source": "m", "target": "p", "kind": "success"},
+        {"id": "2", "source": "p", "target": "ok", "kind": "success"},
+        {"id": "3", "source": "p", "target": "h", "kind": "failure"},
+    ],
+}
+
+
+async def test_continuous_failure_retries_capped_then_manual_abort(harness):
+    """连续失败：有限次重试（2 次）用完后停在人工处置节点，只能终止。"""
+    store, robot, engine = harness
+    robot.set_obstacle(True)
+    eid = engine.start("flow1", LOOP_FLOW)
+
+    async def wait_manual(expected_attempt: int):
+        await wait_until(lambda: (
+            store.get_execution(eid)["status"] == "manual"
+            and [r for r in store.get_execution(eid)["node_runs"] if r["node_id"] == "h"][-1]["attempt"] == expected_attempt
+        ))
+        return engine.get(eid).manual
+
+    manual = await wait_manual(1)
+    assert manual["remaining"] == 2
+    assert engine.manual_decide(eid, "retry")[0]
+    manual = await wait_manual(2)
+    assert manual["remaining"] == 1
+    assert engine.manual_decide(eid, "retry")[0]
+    manual = await wait_manual(3)
+    # 达到上限：明确停在人工处置节点，重试被拒绝
+    assert manual["remaining"] == 0
+    ok, reason = engine.manual_decide(eid, "retry")
+    assert ok is False and "上限" in reason
+    assert store.get_execution(eid)["status"] == "manual"
+    assert engine.manual_decide(eid, "abort")[0]
+    await wait_until(lambda: store.get_execution(eid)["status"] == "aborted")
+
+    runs = store.get_execution(eid)["node_runs"]
+    p_attempts = [r for r in runs if r["node_id"] == "p"]
+    m_attempts = [r for r in runs if r["node_id"] == "m"]
+    # 初次 + 2 次重试 = 3 轮，节点历史按 attempt 分清，没有被旧回路覆盖
+    assert [r["attempt"] for r in p_attempts] == [1, 2, 3]
+    assert [r["attempt"] for r in m_attempts] == [1, 2, 3]
+    assert all(r["status"] == "failed" for r in p_attempts)
+    assert "ok" not in {r["node_id"] for r in runs}
+
+
+async def test_second_attempt_succeeds(harness):
+    """第一次失败走回路，人工处置后重试；第二次成功，旧失败不被当成完成。"""
+    store, robot, engine = harness
+    robot.set_obstacle(True)
+    eid = engine.start("flow1", LOOP_FLOW)
+    await wait_until(lambda: store.get_execution(eid)["status"] == "manual")
+    assert engine.manual_decide(eid, "retry")[0]
+
+    # 第二次经过取物节点前清除障碍物
+    await wait_until(
+        lambda: [r for r in store.get_execution(eid)["node_runs"]
+                 if r["node_id"] == "p"] and
+        [r for r in store.get_execution(eid)["node_runs"] if r["node_id"] == "p"][-1]["attempt"] == 2
+        and [r for r in store.get_execution(eid)["node_runs"] if r["node_id"] == "p"][-1]["status"] == "running")
+    robot.set_obstacle(False)
+    await wait_until(lambda: store.get_execution(eid)["status"] == "succeeded")
+
+    runs = store.get_execution(eid)["node_runs"]
+    p_runs = [r for r in runs if r["node_id"] == "p"]
+    assert [(r["attempt"], r["status"]) for r in p_runs] == [
+        (1, "failed"), (2, "succeeded")]
+    ok_runs = [r for r in runs if r["node_id"] == "ok"]
+    assert len(ok_runs) == 1
+    assert robot.status()["holding"] == "包裹"
+
+
+async def test_cancel_then_late_result_is_ignored(harness):
+    """取消后动作迟到的成功结果不能当作新一轮完成，后续节点不得启动。"""
+    store, robot, engine = harness
+
+    class FlakyRobot(VirtualRobot):
+        """模拟：move 的最后一步在收到取消后仍“迟到地”完成坐标推进。"""
+        async def move(self, x, y, progress, stop, gate=None):  # type: ignore[override]
+            import asyncio as _aio
+            async with self._lock:
+                self.state.idle = False
+                await _aio.sleep(0.3)
+                if stop.is_set():
+                    # 现实中驱动可能依然回报了到位结果
+                    self.state.x, self.state.y = float(x), float(y)
+                    self.state.idle = True
+                    return
+                self.state.x, self.state.y = float(x), float(y)
+                self.state.idle = True
+
+    robot2 = FlakyRobot()
+    engine2 = Engine(store, robot2)
+    flow = {
+        "nodes": [
+            {"id": "m", "type": "move", "label": "移动", "params": {"x": 2, "y": 0}},
+            {"id": "n", "type": "log", "label": "下一步", "params": {"message": "next"}},
+        ],
+        "edges": [{"id": "1", "source": "m", "target": "n", "kind": "success"}],
+    }
+    eid = engine2.start("flow1", flow)
+    await wait_until(
+        lambda: any(r["node_id"] == "m" and r["status"] == "running"
+                    for r in store.get_execution(eid)["node_runs"]))
+    assert engine2.cancel(eid)
+    await wait_until(lambda: store.get_execution(eid)["status"] == "cancelled")
+
+    runs = store.get_execution(eid)["node_runs"]
+    assert "n" not in {r["node_id"] for r in runs}
+    m_run = [r for r in runs if r["node_id"] == "m"][-1]
+    assert m_run["status"] == "cancelled"
+    types = [e["type"] for e in store.get_events(eid)]
+    assert "node_late_result_ignored" in types
+    assert "node_succeeded" not in types

@@ -7,7 +7,7 @@ from .simulator import ActionCancelled, ActionFailed, VirtualRobot
 from .store import Store
 
 
-TERMINAL = {"succeeded", "failed", "cancelled", "interrupted"}
+TERMINAL = {"succeeded", "failed", "cancelled", "interrupted", "aborted"}
 
 
 @dataclass
@@ -21,6 +21,10 @@ class Execution:
     resume: asyncio.Event = field(default_factory=asyncio.Event)
     wait_condition: str | None = None
     condition_met: asyncio.Event = field(default_factory=asyncio.Event)
+    # 当前等待人工处置的节点信息：{"node_id","remaining","detail"}
+    manual: dict | None = None
+    manual_action: str | None = None  # "retry" / "abort"
+    manual_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     def next_node(self, node_id: str, kind: str) -> str | None:
         for edge in self.definition.get("edges", []):
@@ -87,7 +91,10 @@ class Engine:
             return False
         execution.paused = False
         execution.resume.set()
-        restored = "waiting" if execution.wait_condition else "running"
+        if execution.manual is not None:
+            restored = "manual"
+        else:
+            restored = "waiting" if execution.wait_condition else "running"
         self._set_status(execution_id, restored)
         self._emit(execution_id, "execution_resumed",
                    message=f"任务已恢复（原状态：暂停于{'等待' if execution.wait_condition else '动作'}）",
@@ -116,6 +123,19 @@ class Engine:
             return True
         return False
 
+    def manual_decide(self, execution_id: str, action: str) -> tuple[bool, str | None]:
+        """人工处置：retry 回到指定节点重试；abort 终止在当前处置节点。"""
+        execution = self._executions.get(execution_id)
+        if not execution or execution.stop.is_set() or execution.manual is None:
+            return False, "当前没有等待人工处置的节点"
+        if action not in ("retry", "abort"):
+            return False, f"未知人工处置动作：{action}"
+        if action == "retry" and execution.manual["remaining"] <= 0:
+            return False, "重试次数已达上限，请终止任务"
+        execution.manual_action = action
+        execution.manual_event.set()
+        return True, None
+
     async def _gate(self, execution: Execution) -> None:
         while execution.paused and not execution.stop.is_set():
             try:
@@ -140,33 +160,65 @@ class Engine:
                     final_status = "cancelled"
                     break
                 node = nodes[current]
-                self.store.start_node_run(eid, current)
+                attempt = self.store.start_node_run(eid, current)
                 self._emit(eid, "node_started", current,
-                           f"开始：{node.get('label') or current}")
+                           f"开始（第 {attempt} 次）：{node.get('label') or current}",
+                           data={"attempt": attempt})
                 outcome = await self._execute_node(execution, node)
                 kind, detail, next_kind = outcome
+                # 取消之后到达的任何结果都是“迟到结果”：不能当成新一轮完成，
+                # 后续节点也绝不允许再启动。
+                if execution.stop.is_set() and kind != "cancelled":
+                    self.store.update_node_run(
+                        eid, current, "cancelled",
+                        f"取消后收到迟到结果（{detail}），不计入", True)
+                    self._emit(eid, "node_late_result_ignored", current,
+                               f"取消后的迟到结果已忽略：{detail}",
+                               data={"attempt": attempt, "late_outcome": kind})
+                    final_status = "cancelled"
+                    break
                 if kind == "cancelled":
                     self.store.update_node_run(eid, current, "cancelled", detail, True)
                     self._emit(eid, "node_cancelled", current,
-                               f"动作收尾后取消：{detail}")
+                               f"动作收尾后取消：{detail}", data={"attempt": attempt})
                     final_status = "cancelled"
                     break
                 if kind == "failure":
                     self.store.update_node_run(eid, current, "failed", detail, True)
-                    self._emit(eid, "node_failed", current, f"失败：{detail}",
-                               data={"detail": detail})
+                    self._emit(eid, "node_failed", current,
+                               f"第 {attempt} 次失败：{detail}",
+                               data={"attempt": attempt, "detail": detail})
                     target = execution.next_node(current, "failure")
                     if target is None:
                         final_status = "failed"
                         break
                     self._emit(eid, "branch_taken", current,
                                f"失败后走向：{nodes[target].get('label') or target}",
-                               data={"edge": "failure", "target": target})
+                               data={"edge": "failure", "target": target,
+                                     "attempt": attempt})
+                    current = target
+                    continue
+                if kind == "manual":
+                    if detail == "abort":
+                        self.store.update_node_run(eid, current, "cancelled",
+                                                   "人工终止，流程停在此处", True)
+                        self._emit(eid, "node_manual_aborted", current,
+                                   "人工终止：流程停在人工处置节点",
+                                   data={"attempt": attempt})
+                        final_status = "aborted"
+                        break
+                    target = detail.split(":", 1)[1]
+                    self.store.update_node_run(eid, current, "succeeded",
+                                               f"人工处置后回到 {target} 重试", True)
+                    self._emit(eid, "node_manual_retry", current,
+                               f"人工处置：回到 {nodes[target].get('label') or target} 重试",
+                               data={"attempt": attempt, "target": target})
                     current = target
                     continue
                 self.store.update_node_run(eid, current, "succeeded", detail, True)
                 self._emit(eid, "node_succeeded", current,
-                           f"完成：{node.get('label') or current}")
+                           f"完成（第 {attempt} 次）：{node.get('label') or current}",
+                           data={"attempt": attempt})
                 target = execution.next_node(current, "success")
                 current = target
             self._set_status(eid, final_status)
@@ -188,6 +240,54 @@ class Engine:
         async def progress(data: dict) -> None:
             self._emit(eid, "node_progress", node["id"],
                        data={**data, "robot": self.robot.status()})
+
+        if ntype == "manual":
+            # 人工处置节点：失败回路到此后，由人工选择“重试（回到指定节点）”或“终止”。
+            # params.retry_target 指定重试回到的节点；params.max_retries 为该节点允许的
+            # 重试总次数（从 0 开始计数），达到上限后只能终止，执行明确停在此节点。
+            max_retries = int(params.get("max_retries", 2))
+            retry_target = params.get("retry_target")
+            prior_retries = sum(
+                1 for nr in self.store.get_execution(eid)["node_runs"]
+                if nr["node_id"] == node["id"]
+                and (nr["detail"] or "").startswith("人工处置后回到")
+            )
+            remaining = max_retries - prior_retries
+            prompt = str(params.get("prompt", "等待人工处置：重试或终止"))
+            execution.manual = {"node_id": node["id"], "remaining": remaining,
+                                "detail": prompt, "retry_target": retry_target}
+            execution.manual_action = None
+            execution.manual_event.clear()
+            self.store.update_node_run(eid, node["id"], "manual", prompt)
+            self._set_status(eid, "manual")
+            if remaining > 0 and retry_target:
+                hint = f"{prompt}（剩余重试 {remaining}/{max_retries}）"
+            else:
+                hint = f"{prompt}（重试已达上限 {max_retries} 次，请终止）"
+            self._emit(eid, "node_manual_waiting", node["id"], hint,
+                       data={"remaining": remaining, "max_retries": max_retries,
+                             "retry_target": retry_target})
+            try:
+                while True:
+                    await self._gate(execution)
+                    if execution.stop.is_set():
+                        return "cancelled", "人工处置等待被取消", ""
+                    try:
+                        await asyncio.wait_for(execution.manual_event.wait(), timeout=0.2)
+                    except asyncio.TimeoutError:
+                        continue
+                    if execution.stop.is_set():
+                        return "cancelled", "人工处置等待被取消", ""
+                    action = execution.manual_action
+                    self._emit(eid, "node_manual_decision", node["id"],
+                               "人工选择：重试" if action == "retry" else "人工选择：终止",
+                               data={"action": action, "remaining": remaining})
+                    if action == "abort":
+                        return "manual", "abort", ""
+                    return "manual", f"retry:{retry_target}", "success"
+            finally:
+                execution.manual = None
+                execution.manual_action = None
 
         if ntype == "log":
             message = str(params.get("message", ""))

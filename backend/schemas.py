@@ -5,7 +5,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
-NodeType = Literal["move", "pick", "place", "wait", "log"]
+NodeType = Literal["move", "pick", "place", "wait", "log", "manual"]
 EdgeKind = Literal["success", "failure"]
 
 

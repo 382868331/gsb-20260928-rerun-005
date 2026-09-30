@@ -94,6 +94,8 @@ class VirtualRobot:
                                     "phase": "夹取中" if i == 1 else "提起中"})
 
                 await self._steps(2, 0.4, stop, report, gate)
+                if stop.is_set():
+                    raise ActionCancelled("收到取消请求，动作收尾")
                 if self.obstacle:
                     raise ActionFailed("检测到障碍物，无法取物")
             except (ActionCancelled, ActionFailed):
@@ -116,6 +118,8 @@ class VirtualRobot:
                                     "phase": "放下中" if i == 1 else "松开夹爪"})
 
                 await self._steps(2, 0.4, stop, report, gate)
+                if stop.is_set():
+                    raise ActionCancelled("收到取消请求，动作收尾")
             except ActionCancelled:
                 self.state.idle = True
                 raise

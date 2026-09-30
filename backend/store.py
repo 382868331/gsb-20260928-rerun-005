@@ -101,13 +101,21 @@ class Store:
                 (status, execution_id),
             )
 
-    def start_node_run(self, execution_id: str, node_id: str, attempt: int = 1) -> None:
+    def start_node_run(self, execution_id: str, node_id: str) -> int:
+        """节点（含回路后的再次进入）开启新的一次执行，attempt 按该节点历史经过自增。"""
         with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(attempt),0)+1 AS attempt FROM node_runs "
+                "WHERE execution_id=? AND node_id=?",
+                (execution_id, node_id),
+            ).fetchone()
+            attempt = row["attempt"]
             self._conn.execute(
                 "INSERT INTO node_runs(execution_id,node_id,attempt,status) "
                 "VALUES(?,?,?,?)",
                 (execution_id, node_id, attempt, "running"),
             )
+        return attempt
 
     def finish_node_run(
         self, execution_id: str, node_id: str, status: str, detail: str | None = None
@@ -177,7 +185,7 @@ class Store:
             if not er:
                 return None
             nr = self._conn.execute(
-                "SELECT node_id, attempt, status, detail, started_at, finished_at "
+                "SELECT id, node_id, attempt, status, detail, started_at, finished_at "
                 "FROM node_runs WHERE execution_id=? ORDER BY id",
                 (execution_id,),
             ).fetchall()
@@ -200,5 +208,5 @@ class Store:
         with self._lock, self._conn:
             self._conn.execute(
                 "UPDATE executions SET status='interrupted' "
-                "WHERE status IN ('running','pausing','waiting','cancelling')"
+                "WHERE status IN ('running','pausing','waiting','manual','cancelling')"
             )

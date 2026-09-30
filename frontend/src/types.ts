@@ -1,4 +1,4 @@
-export type NodeType = 'move' | 'pick' | 'place' | 'wait' | 'log';
+export type NodeType = 'move' | 'pick' | 'place' | 'wait' | 'log' | 'manual';
 
 export interface FlowNode {
   id: string;
@@ -23,10 +23,21 @@ export interface Flow {
 }
 
 export interface NodeRun {
+  id?: number;
   node_id: string;
   status: string;
   detail: string | null;
   attempt: number;
+  started_at?: string;
+  finished_at?: string | null;
+}
+
+export interface ManualInfo {
+  node_id: string;
+  remaining: number;
+  max_retries?: number;
+  detail: string;
+  retry_target: string | null;
 }
 
 export interface Execution {
@@ -35,6 +46,7 @@ export interface Execution {
   status: string;
   node_runs: NodeRun[];
   waiting_for: string | null;
+  manual?: ManualInfo | null;
   robot: { x: number; y: number; holding: string | null; idle: boolean; obstacle: boolean };
 }
 
