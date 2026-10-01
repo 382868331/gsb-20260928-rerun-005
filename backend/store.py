@@ -64,6 +64,30 @@ class Store:
                     detail TEXT,
                     created_at TEXT NOT NULL DEFAULT (datetime('now'))
                 );
+
+                CREATE TABLE IF NOT EXISTS device_snapshots(
+                    execution_id TEXT PRIMARY KEY,
+                    x REAL NOT NULL,
+                    y REAL NOT NULL,
+                    holding TEXT,
+                    idle INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE IF NOT EXISTS pending_actions(
+                    execution_id TEXT PRIMARY KEY,
+                    node_id TEXT NOT NULL,
+                    attempt INTEGER NOT NULL,
+                    action_type TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    params TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE IF NOT EXISTS recovery_decisions(
+                    execution_id TEXT PRIMARY KEY,
+                    decision TEXT NOT NULL,
+                    reason TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
                 """
             )
             # 旧库升级：补充终止原因列
@@ -72,6 +96,101 @@ class Store:
             if "termination_reason" not in cols:
                 self._conn.execute(
                     "ALTER TABLE executions ADD COLUMN termination_reason TEXT")
+
+    # ---- 恢复相关：设备快照 / 未确认动作 / 人工核实决定 ----
+
+    def save_device_snapshot(
+        self, execution_id: str, x: float, y: float, holding: str | None,
+        idle: bool = True,
+    ) -> None:
+        """记录最后已确认的设备状态（动作完成点），用于重启后恢复。"""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO device_snapshots(execution_id,x,y,holding,idle) "
+                "VALUES(?,?,?,?,?) "
+                "ON CONFLICT(execution_id) DO UPDATE SET "
+                "x=excluded.x,y=excluded.y,holding=excluded.holding,idle=excluded.idle,"
+                "updated_at=datetime('now')",
+                (execution_id, x, y, holding, 1 if idle else 0),
+            )
+
+    def get_device_snapshot(self, execution_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT x,y,holding,idle FROM device_snapshots WHERE execution_id=?",
+                (execution_id,),
+            ).fetchone()
+        if not r:
+            return None
+        return {"x": r["x"], "y": r["y"], "holding": r["holding"],
+                "idle": bool(r["idle"])}
+
+    def set_pending_action(
+        self, execution_id: str, node_id: str, attempt: int, action_type: str,
+        phase: str, params: dict[str, Any] | None = None,
+    ) -> None:
+        """记录启动后尚未确认结果的动作（崩溃点）。"""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO pending_actions(execution_id,node_id,attempt,action_type,phase,params) "
+                "VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(execution_id) DO UPDATE SET node_id=excluded.node_id,"
+                "attempt=excluded.attempt,action_type=excluded.action_type,"
+                "phase=excluded.phase,params=excluded.params,created_at=datetime('now')",
+                (execution_id, node_id, attempt, action_type, phase,
+                 json.dumps(params, ensure_ascii=False) if params is not None else None),
+            )
+
+    def clear_pending_action(self, execution_id: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM pending_actions WHERE execution_id=?", (execution_id,))
+
+    def get_pending_action(self, execution_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT node_id,attempt,action_type,phase,params FROM pending_actions "
+                "WHERE execution_id=?",
+                (execution_id,),
+            ).fetchone()
+        if not r:
+            return None
+        return {"node_id": r["node_id"], "attempt": r["attempt"],
+                "action_type": r["action_type"], "phase": r["phase"],
+                "params": json.loads(r["params"]) if r["params"] else None}
+
+    def save_recovery_decision(
+        self, execution_id: str, decision: str, reason: str | None = None,
+    ) -> bool:
+        """保存恢复前的人工核实决定。已保存时返回 False（连续重开不重复要求）。"""
+        with self._lock, self._conn:
+            exists = self._conn.execute(
+                "SELECT 1 FROM recovery_decisions WHERE execution_id=?",
+                (execution_id,),
+            ).fetchone()
+            if exists:
+                return False
+            self._conn.execute(
+                "INSERT INTO recovery_decisions(execution_id,decision,reason) VALUES(?,?,?)",
+                (execution_id, decision, reason),
+            )
+            return True
+
+    def get_recovery_decision(self, execution_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            r = self._conn.execute(
+                "SELECT decision,reason FROM recovery_decisions WHERE execution_id=?",
+                (execution_id,),
+            ).fetchone()
+        return dict(r) if r else None
+
+    def list_status(self, statuses: list[str]) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT id FROM executions WHERE status IN ({','.join('?' * len(statuses))})",
+                statuses,
+            ).fetchall()
+        return [r["id"] for r in rows]
 
     def save_flow(self, flow_id: str, name: str, definition: dict[str, Any]) -> None:
         with self._lock, self._conn:
@@ -284,6 +403,9 @@ class Store:
             "started_at": er["started_at"], "updated_at": er["updated_at"],
             "node_runs": [dict(r) for r in nr],
             "followups": self.get_node_followups(execution_id),
+            "device_snapshot": self.get_device_snapshot(execution_id),
+            "pending_action": self.get_pending_action(execution_id),
+            "recovery_decision": self.get_recovery_decision(execution_id),
         }
 
     def list_executions(self) -> list[dict[str, Any]]:
@@ -295,9 +417,13 @@ class Store:
         return [dict(r) for r in rows]
 
     def mark_stale_running(self) -> None:
-        """进程重启后，把遗留的运行/等待中执行标记为 interrupted。"""
+        """进程重启后，遗留的未终止执行停在「待核实」阶段，等待人工处置。
+
+        不再直接标记为 interrupted：执行顺序、已确定的终止决定都要保留，
+        由操作者核实设备状态后选择继续收尾或结束流程。
+        """
         with self._lock, self._conn:
             self._conn.execute(
-                "UPDATE executions SET status='interrupted' "
+                "UPDATE executions SET status='awaiting_verification' "
                 "WHERE status IN ('running','paused','waiting','cancelling','awaiting_manual')"
             )

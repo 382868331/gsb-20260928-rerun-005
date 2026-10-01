@@ -52,6 +52,7 @@ function TaskNode({ data }: NodeProps<Node<NodeData>>) {
     || runStatus === 'failed' && `✗ 第 ${attempt} 次失败${detail ? `：${detail}` : ''}`
     || runStatus === 'cancelled' && '⊘ 已取消'
     || runStatus === 'aborted' && '⊘ 人工终止'
+    || runStatus === 'interrupted' && '⚠ 结果未确认（重启后已收尾接续）'
     || '';
   return (
     <div className={cls}>

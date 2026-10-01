@@ -355,7 +355,7 @@ async def test_cancel_during_cleanup_keeps_original_failure(harness):
 
 
 async def test_persisted_termination_and_recovery(tmp_path):
-    """落库的终止原因/后续信息在重新打开（模拟重启）后保持一致；遗留运行态为 interrupted。"""
+    """落库的终止原因/后续信息在重启后保持一致；遗留运行态停在待核实阶段。"""
     db = tmp_path / "test.db"
     store = Store(db)
     robot = VirtualRobot()
@@ -395,10 +395,226 @@ async def test_persisted_termination_and_recovery(tmp_path):
     for execution in list(engine2._executions.values()):
         execution.task.cancel()
     await asyncio.sleep(0.1)
-    # 新进程启动新引擎：遗留运行态标记为 interrupted，已终止记录不受影响
+    # 新进程启动新引擎：遗留运行态停在「待核实」，已终止记录不受影响
     store3 = Store(db)
     Engine(store3, VirtualRobot())
-    assert store3.get_execution(eid2)["status"] == "interrupted"
+    assert store3.get_execution(eid2)["status"] == "awaiting_verification"
     assert store3.get_execution(eid)["status"] == "cancelled"
     for execution in list(engine._executions.values()):
         execution.task.cancel()
+
+
+async def test_recovery_continue_mid_action_no_replay(tmp_path):
+    """重启待核实：选择继续收尾后，已发出动作不重放，从后续顺序接续。"""
+    db = tmp_path / "test.db"
+    store = Store(db)
+    robot = VirtualRobot()
+    engine = Engine(store, robot)
+    engine.schedule_pending_recoveries()
+    flow = {"nodes": [
+        {"id": "m", "type": "move", "label": "长距离移动", "params": {"x": 6, "y": 0}},
+        {"id": "n", "type": "log", "label": "下一步", "params": {"message": "go"}},
+    ], "edges": [{"id": "1", "source": "m", "target": "n", "kind": "success"}]}
+    eid = engine.start("flow1", flow)
+    await wait_until(
+        lambda: any(nr["node_id"] == "m" and nr["status"] == "running"
+                    for nr in store.get_execution(eid)["node_runs"]))
+    for execution in list(engine._executions.values()):
+        execution.task.cancel()
+    await asyncio.sleep(0.1)
+
+    # 模拟重启：执行停在待核实，展示持有物/最后位置/未确认动作
+    store2 = Store(db)
+    robot2 = VirtualRobot()
+    engine2 = Engine(store2, robot2)
+    engine2.schedule_pending_recoveries()
+    record = store2.get_execution(eid)
+    assert record["status"] == "awaiting_verification"
+    pending = record["pending_action"]
+    assert pending["node_id"] == "m" and pending["action_type"] == "move"
+    snapshot = record["device_snapshot"]
+    assert snapshot is not None
+
+    # 核实期间的迟到回应只补充到旧执行记录，不发出新动作
+    assert engine2.report_late_response(eid, "success", "移动实际已完成")
+    await asyncio.sleep(0.2)
+    assert store2.get_execution(eid)["status"] == "awaiting_verification"
+    followups = store2.get_execution(eid)["followups"]
+    assert any(f["kind"] == "late_result" and f["node_id"] == "m" for f in followups)
+
+    assert engine2.verify_recovery(eid, True, "现场确认设备安全")
+    await wait_until(lambda: store2.get_execution(eid)["status"] == "succeeded", timeout=8)
+    final = store2.get_execution(eid)
+    move_runs = [nr for nr in final["node_runs"] if nr["node_id"] == "m"]
+    # 移动没有被第二次执行：旧记录定格为 interrupted（结果未知）
+    assert [nr["status"] for nr in move_runs] == ["interrupted"]
+    assert any(nr["node_id"] == "n" for nr in final["node_runs"])
+    assert final["termination_reason"] == "全部节点执行成功"
+
+
+async def test_recovery_end_keeps_original_failure(tmp_path):
+    """待核实时选择结束：原故障原因与人工处置原因分别保留，不发出新动作。"""
+    db = tmp_path / "test.db"
+    store = Store(db)
+    robot = VirtualRobot()
+    engine = Engine(store, robot)
+    engine.schedule_pending_recoveries()
+    robot.set_obstacle(True)
+    eid = engine.start("flow1", CLEANUP_FLOW)
+    await wait_until(
+        lambda: any(nr["node_id"] == "p" and nr["status"] == "failed"
+                    for nr in store.get_execution(eid)["node_runs"]), timeout=12)
+    await asyncio.sleep(0.05)
+    for execution in list(engine._executions.values()):
+        execution.task.cancel()
+    await asyncio.sleep(0.1)
+
+    store2 = Store(db)
+    engine2 = Engine(store2, VirtualRobot())
+    engine2.schedule_pending_recoveries()
+    assert store2.get_execution(eid)["status"] == "awaiting_verification"
+    assert engine2.verify_recovery(eid, False, "现场无法确认，结束流程")
+    record = store2.get_execution(eid)
+    assert record["status"] == "resolved"
+    reason = record["termination_reason"]
+    assert "障碍" in reason  # 原故障保留
+    assert "现场无法确认，结束流程" in reason  # 人工处置原因保留
+
+    # 连续重开：决定已保存，不重复要求，也不改变终态
+    store3 = Store(db)
+    engine3 = Engine(store3, VirtualRobot())
+    engine3.schedule_pending_recoveries()
+    assert store3.get_execution(eid)["status"] == "resolved"
+    assert engine3.verify_recovery(eid, True) is False
+
+
+async def test_recovery_cancel_again_and_idempotent_decision(tmp_path):
+    """待核实期间再次取消：结束流程、不移动；重复决定被拒绝。"""
+    db = tmp_path / "test.db"
+    store = Store(db)
+    robot = VirtualRobot()
+    engine = Engine(store, robot)
+    engine.schedule_pending_recoveries()
+    flow = {"nodes": [
+        {"id": "m", "type": "move", "label": "移动", "params": {"x": 5, "y": 0}},
+    ], "edges": []}
+    eid = engine.start("flow1", flow)
+    await wait_until(
+        lambda: any(nr["node_id"] == "m" and nr["status"] == "running"
+                    for nr in store.get_execution(eid)["node_runs"]))
+    for execution in list(engine._executions.values()):
+        execution.task.cancel()
+    await asyncio.sleep(0.1)
+
+    store2 = Store(db)
+    robot2 = VirtualRobot()
+    engine2 = Engine(store2, robot2)
+    engine2.schedule_pending_recoveries()
+    before = robot2.status()
+    assert engine2.cancel(eid)
+    await asyncio.sleep(0.2)
+    assert store2.get_execution(eid)["status"] == "resolved"
+    assert robot2.status() == before  # 没有发出任何新动作
+    assert engine2.cancel(eid) is False
+
+
+async def test_recovery_resume_cleanup_skips_done_stage(tmp_path):
+    """在失败收尾中断重启：恢复后只做未完成的收尾阶段，已放下不重复。"""
+    db = tmp_path / "test.db"
+    store = Store(db)
+    robot = VirtualRobot()
+    engine = Engine(store, robot)
+    engine.schedule_pending_recoveries()
+    robot.set_obstacle(True)
+    eid = engine.start("flow1", CLEANUP_FLOW)
+    # 等到收尾的放下阶段已完成（此处机械爪为空，记 noop）、尚未返回安全位置
+    await wait_until(
+        lambda: any(f["kind"] == "cleanup" and f["outcome"] in ("succeeded", "noop")
+                    for f in store.get_execution(eid)["followups"]), timeout=12)
+    for execution in list(engine._executions.values()):
+        execution.task.cancel()
+    await asyncio.sleep(0.1)
+
+    store2 = Store(db)
+    robot2 = VirtualRobot()
+    engine2 = Engine(store2, robot2)
+    engine2.schedule_pending_recoveries()
+    assert store2.get_execution(eid)["status"] == "awaiting_verification"
+    pending = store2.get_execution(eid)["pending_action"]
+    assert pending["phase"] == "cleanup"
+
+    release_calls = {"n": 0}
+    orig_release = robot2.release_if_holding
+
+    async def counted_release(*args, **kwargs):
+        release_calls["n"] += 1
+        return await orig_release(*args, **kwargs)
+
+    robot2.release_if_holding = counted_release  # type: ignore[assignment]
+    assert engine2.verify_recovery(eid, True)
+    await wait_until(lambda: store2.get_execution(eid)["status"] == "succeeded", timeout=10)
+    # 已完成的放下阶段没有再次执行
+    assert release_calls["n"] == 0
+    assert (robot2.status()["x"], robot2.status()["y"]) == (0.0, 0.0)
+    # 原失败与失败分支照常推进
+    record = store2.get_execution(eid)
+    pick = [nr for nr in record["node_runs"] if nr["node_id"] == "p"][0]
+    assert pick["status"] == "failed" and "障碍" in pick["detail"]
+    assert any(nr["node_id"] == "r" for nr in record["node_runs"])
+
+
+async def test_recovery_resume_wait_keeps_waiting(tmp_path):
+    """等待条件期间重启：恢复后继续等待原条件，满足后正常接续。"""
+    db = tmp_path / "test.db"
+    store = Store(db)
+    robot = VirtualRobot()
+    engine = Engine(store, robot)
+    engine.schedule_pending_recoveries()
+    eid = engine.start("flow1", FLOW)
+    await wait_until(lambda: store.get_execution(eid)["status"] == "waiting")
+    for execution in list(engine._executions.values()):
+        execution.task.cancel()
+    await asyncio.sleep(0.1)
+
+    store2 = Store(db)
+    robot2 = VirtualRobot()
+    engine2 = Engine(store2, robot2)
+    engine2.schedule_pending_recoveries()
+    assert store2.get_execution(eid)["status"] == "awaiting_verification"
+    assert engine2.verify_recovery(eid, True)
+    await wait_until(lambda: store2.get_execution(eid)["status"] == "waiting")
+    assert engine2.get(eid).wait_condition == "ready"
+    assert engine2.signal(eid, "ready")
+    await wait_until(lambda: store2.get_execution(eid)["status"] == "succeeded", timeout=10)
+
+
+async def test_saved_decision_auto_resumes_after_restart(tmp_path):
+    """已作出继续决定但恢复协程未跑完又重启：不重复询问，自动接续。"""
+    db = tmp_path / "test.db"
+    store = Store(db)
+    robot = VirtualRobot()
+    engine = Engine(store, robot)
+    engine.schedule_pending_recoveries()
+    flow = {"nodes": [
+        {"id": "m", "type": "move", "label": "移动", "params": {"x": 3, "y": 0}},
+        {"id": "n", "type": "log", "label": "下一步", "params": {"message": "go"}},
+    ], "edges": [{"id": "1", "source": "m", "target": "n", "kind": "success"}]}
+    eid = engine.start("flow1", flow)
+    await wait_until(
+        lambda: any(nr["node_id"] == "m" and nr["status"] == "running"
+                    for nr in store.get_execution(eid)["node_runs"]))
+    for execution in list(engine._executions.values()):
+        execution.task.cancel()
+    await asyncio.sleep(0.1)
+
+    store2 = Store(db)
+    engine2 = Engine(store2, VirtualRobot())
+    # 保存继续决定（模拟核实完成后尚未跑完又重启）
+    assert store2.save_recovery_decision(eid, "continue", "已核实")
+
+    store3 = Store(db)
+    engine3 = Engine(store3, VirtualRobot())
+    engine3.schedule_pending_recoveries()
+    await wait_until(lambda: store3.get_execution(eid)["status"] == "succeeded", timeout=8)
+    # 不会重复要求决定
+    assert engine3.verify_recovery(eid, True) is False

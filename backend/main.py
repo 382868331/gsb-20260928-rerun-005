@@ -8,7 +8,8 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 
 from .engine import Engine
-from .schemas import FlowIn, LateFinishIn, ManualResolveIn, ObstacleIn
+from .schemas import (FlowIn, LateFinishIn, LateResponseIn, ManualResolveIn,
+                      ObstacleIn, RecoveryVerifyIn)
 from .simulator import VirtualRobot
 from .store import Store
 
@@ -50,6 +51,7 @@ async def lifespan(app: FastAPI):
     app.state.store = store
     app.state.robot = robot
     app.state.engine = engine
+    engine.schedule_pending_recoveries()
     yield
 
 
@@ -139,10 +141,34 @@ async def get_execution(execution_id: str):
     record["robot"] = app.state.robot.status()
     execution = app.state.engine.get(execution_id)
     record["waiting_for"] = execution.wait_condition if execution else None
-    record["manual_node"] = execution.manual_node if execution else None
-    record["current_node"] = execution.current_node if execution else None
-    record["current_attempt"] = execution.current_attempt if execution else 0
+    if execution:
+        record["manual_node"] = execution.manual_node
+        record["current_node"] = execution.current_node
+        record["current_attempt"] = execution.current_attempt
+    else:
+        pending = record.get("pending_action")
+        record["manual_node"] = pending["node_id"] if pending and pending["phase"] == "manual" else None
+        record["current_node"] = pending["node_id"] if pending else None
+        record["current_attempt"] = pending["attempt"] if pending else 0
     return record
+
+
+@app.post("/api/executions/{execution_id}/recovery-verify")
+async def verify_recovery(execution_id: str, payload: RecoveryVerifyIn):
+    """恢复前的人工处置：核实设备状态后选择继续收尾或结束本次流程。"""
+    if not app.state.engine.verify_recovery(
+            execution_id, payload.continue_cleanup, payload.note):
+        raise HTTPException(409, "当前不处于待核实阶段，或已作出过决定")
+    return {"decision": "continue" if payload.continue_cleanup else "end"}
+
+
+@app.post("/api/executions/{execution_id}/late-response")
+async def late_response(execution_id: str, payload: LateResponseIn):
+    """核实期间收到设备迟到回应：仅补充到旧执行记录，不发出新动作。"""
+    if not app.state.engine.report_late_response(
+            execution_id, payload.outcome, payload.detail):
+        raise HTTPException(409, "没有可补充的未确认动作")
+    return {"recorded": True}
 
 
 @app.get("/api/executions/{execution_id}/events")

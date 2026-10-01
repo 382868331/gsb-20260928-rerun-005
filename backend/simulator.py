@@ -50,6 +50,13 @@ class VirtualRobot:
     def status(self) -> dict:
         return {**self.state.snapshot(), "obstacle": self.obstacle}
 
+    def restore_state(self, x: float, y: float, holding: str | None) -> None:
+        """重启恢复：按最后已确认快照还原设备坐标与持有物。"""
+        self.state.x = float(x)
+        self.state.y = float(y)
+        self.state.holding = holding
+        self.state.idle = True
+
     async def _steps(self, n: int, delay: float, stop: asyncio.Event,
                      on_step: Callable[[int, int], object] | None = None,
                      gate: Callable[[], Awaitable[None]] | None = None,

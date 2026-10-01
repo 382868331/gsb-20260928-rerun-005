@@ -24,6 +24,18 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ abort }),
     }),
+  verifyRecovery: (id: string, continueCleanup: boolean, note?: string) =>
+    req(`/api/executions/${id}/recovery-verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ continue_cleanup: continueCleanup, note }),
+    }),
+  lateResponse: (id: string, outcome: 'success' | 'failure', detail?: string) =>
+    req(`/api/executions/${id}/late-response`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ outcome, detail }),
+    }),
   setObstacle: (present: boolean) =>
     req('/api/robot/obstacle', {
       method: 'POST',

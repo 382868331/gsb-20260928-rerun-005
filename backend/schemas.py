@@ -49,3 +49,13 @@ class LateFinishIn(BaseModel):
 
 class ManualResolveIn(BaseModel):
     abort: bool = False
+
+
+class RecoveryVerifyIn(BaseModel):
+    continue_cleanup: bool
+    note: str | None = None
+
+
+class LateResponseIn(BaseModel):
+    outcome: str  # success / failure
+    detail: str | None = None

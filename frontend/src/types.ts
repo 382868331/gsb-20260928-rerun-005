@@ -48,6 +48,15 @@ export interface Execution {
   manual_node?: string | null;
   current_node?: string | null;
   current_attempt?: number;
+  device_snapshot?: { x: number; y: number; holding: string | null; idle: boolean } | null;
+  pending_action?: {
+    node_id: string;
+    attempt: number;
+    action_type: string;
+    phase: string;
+    params?: Record<string, unknown> | null;
+  } | null;
+  recovery_decision?: { decision: string; reason: string | null } | null;
   robot: { x: number; y: number; holding: string | null; idle: boolean; obstacle: boolean };
 }
 

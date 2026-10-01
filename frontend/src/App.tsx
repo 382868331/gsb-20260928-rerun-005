@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import FlowCanvas from './FlowCanvas';
 import { api } from './api';
-import type { Execution, ExecEvent, Flow } from './types';
+import type { Execution, ExecEvent, Flow, FlowNode } from './types';
 
 const STATUS_TEXT: Record<string, string> = {
   running: '运行中',
@@ -14,9 +14,17 @@ const STATUS_TEXT: Record<string, string> = {
   cancelled: '已取消',
   resolved: '已人工终止',
   interrupted: '中断',
+  awaiting_verification: '待人工核实（重启恢复）',
 };
 
-const TERMINAL = new Set(['succeeded', 'failed', 'cancelled', 'interrupted']);
+const TERMINAL = new Set(['succeeded', 'failed', 'cancelled', 'interrupted', 'resolved']);
+
+const PHASE_TEXT: Record<string, string> = {
+  action: '动作执行中（结果未确认）',
+  wait: '等待条件',
+  manual: '等待人工处置',
+  cleanup: '失败收尾中',
+};
 
 export default function App() {
   const [flows, setFlows] = useState<Flow[]>([]);
@@ -171,6 +179,17 @@ export default function App() {
               >确认终止，流程停在此处</button>
             </div>
           )}
+          {execution?.status === 'awaiting_verification' && (
+            <VerificationBar
+              execution={execution}
+              flow={flow}
+              onContinue={() => runAction(() => api.verifyRecovery(execution.id, true))}
+              onEnd={(note) => runAction(() => api.verifyRecovery(execution.id, false, note))}
+              onCancel={() => runAction(() => api.cancel(execution.id))}
+              onLate={(outcome) =>
+                runAction(() => api.lateResponse(execution.id, outcome, '现场补充的迟到回应'))}
+            />
+          )}
           {flow && (
             <FlowCanvas
               nodes={flow.definition.nodes}
@@ -208,6 +227,64 @@ export default function App() {
           </div>
         </aside>
       </main>
+    </div>
+  );
+}
+
+function VerificationBar({
+  execution,
+  flow,
+  onContinue,
+  onEnd,
+  onCancel,
+  onLate,
+}: {
+  execution: Execution;
+  flow: Flow | null;
+  onContinue: () => void;
+  onEnd: (note: string) => void;
+  onCancel: () => void;
+  onLate: (outcome: 'success' | 'failure') => void;
+}) {
+  const [note, setNote] = useState('');
+  const snapshot = execution.device_snapshot;
+  const pending = execution.pending_action;
+  const pendingNode: FlowNode | null = pending
+    ? flow?.definition.nodes.find((n) => n.id === pending.node_id) ?? null
+    : null;
+  return (
+    <div className="verify-bar">
+      <div className="verify-bar__head">
+        <span className="verify-bar__title">
+          ⚠ 重启后设备状态无法确认，请先核实现场，再选择恢复方式
+        </span>
+      </div>
+      <div className="verify-grid">
+        <div><b>持有物</b><span>{snapshot?.holding ?? '空（未记录）'}</span></div>
+        <div><b>最后已确认位置</b>
+          <span>({snapshot?.x ?? 0}, {snapshot?.y ?? 0})</span>
+        </div>
+        <div className="verify-grid__wide">
+          <b>尚未确认的动作</b>
+          <span>
+            {pending
+              ? `${pendingNode?.label ?? pending.node_id}（第 ${pending.attempt} 次）— ${PHASE_TEXT[pending.phase] ?? pending.phase}`
+              : '无'}
+          </span>
+        </div>
+        <div className="verify-grid__wide">
+          <b>核实说明（结束时作为人工处置原因保留）</b>
+          <input value={note} onChange={(e) => setNote(e.target.value)} placeholder="如：现场确认无障碍物，但无法确认机械臂位置" />
+        </div>
+      </div>
+      <div className="verify-actions">
+        <span className="verify-hint">核实期间可登记迟到回应，但系统不会发出新的移动/放下动作。</span>
+        <button onClick={() => onLate('success')}>登记迟到成功回应</button>
+        <button onClick={() => onLate('failure')}>登记迟到失败回应</button>
+        <button className="btn-primary" onClick={onContinue}>现场已核实，继续收尾并接续</button>
+        <button className="btn-danger" onClick={() => onEnd(note)}>结束本次流程</button>
+        <button className="btn-danger" onClick={onCancel}>再次取消（立即结束）</button>
+      </div>
     </div>
   );
 }
