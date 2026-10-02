@@ -24,6 +24,18 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ abort }),
     }),
+  resolveRecovery: (id: string, finish: boolean) =>
+    req(`/api/executions/${id}/recovery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ finish }),
+    }),
+  recordLateAction: (id: string, outcome: 'success' | 'failure', detail: string) =>
+    req(`/api/executions/${id}/late-action`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ outcome, detail }),
+    }),
   setObstacle: (present: boolean) =>
     req('/api/robot/obstacle', {
       method: 'POST',

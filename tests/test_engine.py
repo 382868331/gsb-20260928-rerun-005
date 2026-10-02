@@ -9,6 +9,7 @@ import pytest
 pytestmark = pytest.mark.anyio
 
 from backend.engine import Engine
+from backend.simulator import ActionFailed
 from backend.simulator import VirtualRobot
 from backend.store import Store
 
@@ -354,8 +355,8 @@ async def test_cancel_during_cleanup_keeps_original_failure(harness):
     assert any(f["outcome"] == "cancelled" for f in cleanup)
 
 
-async def test_persisted_termination_and_recovery(tmp_path):
-    """落库的终止原因/后续信息在重新打开（模拟重启）后保持一致；遗留运行态为 interrupted。"""
+async def test_persisted_termination_and_manual_recovery(tmp_path):
+    """重启后先进入人工待核实；迟到回应确认后只接续后继，不重跑旧动作。"""
     db = tmp_path / "test.db"
     store = Store(db)
     robot = VirtualRobot()
@@ -377,7 +378,7 @@ async def test_persisted_termination_and_recovery(tmp_path):
     reason_before = store.get_termination_reason(eid)
     assert reason_before
 
-    # 模拟后端重启：旧的运行态标记 interrupted；已终止记录与其原因/后续信息保持不变
+    # 单独打开数据库不影响已终止记录与其原因/后续信息
     Store(db)  # 重启时仅打开数据库，不影响已终止记录
     record = store.get_execution(eid)
     assert record["status"] == "cancelled"
@@ -386,19 +387,128 @@ async def test_persisted_termination_and_recovery(tmp_path):
     move_runs = [nr for nr in record["node_runs"] if nr["node_id"] == "m"]
     assert [nr["status"] for nr in move_runs] == ["cancelled"]
 
-    # 另一个处于 running 的执行在重启（旧进程消失、新引擎构造）后变为 interrupted
+    # 另一个处于 running 的执行在重启后停在人工待核实，不直接判中断
     store2 = Store(db)
     robot2 = VirtualRobot()
     engine2 = Engine(store2, robot2)
     eid2 = engine2.start("flow1", flow)
-    await wait_until(lambda: store2.get_execution(eid2)["status"] == "running")
+    await wait_until(
+        lambda: any(nr["node_id"] == "m" and nr["status"] == "running"
+                    for nr in store2.get_execution(eid2)["node_runs"]))
     for execution in list(engine2._executions.values()):
         execution.task.cancel()
     await asyncio.sleep(0.1)
-    # 新进程启动新引擎：遗留运行态标记为 interrupted，已终止记录不受影响
-    store3 = Store(db)
-    Engine(store3, VirtualRobot())
-    assert store3.get_execution(eid2)["status"] == "interrupted"
+    engine3 = Engine(Store(db), VirtualRobot())
+    store3 = engine3.store
+    # 新进程启动新引擎：遗留运行态等待人工核实，已终止记录不受影响
+    assert store3.get_execution(eid2)["status"] == "awaiting_recovery"
     assert store3.get_execution(eid)["status"] == "cancelled"
+
+    # 核实期间的迟到回应只写入旧执行记录；人工确认后从后继节点继续，不重跑移动
+    assert engine3.record_late_action(eid2, "success", "设备稍后确认移动已完成")
+    assert engine3.resolve_recovery(eid2, finish=True)
+    await wait_until(lambda: store3.get_execution(eid2)["status"] == "succeeded")
+    recovered = store3.get_execution(eid2)
+    assert [nr["status"] for nr in recovered["node_runs"] if nr["node_id"] == "m"] == ["succeeded"]
+    assert [nr["status"] for nr in recovered["node_runs"] if nr["node_id"] == "n"] == ["succeeded"]
+    assert any(f["kind"] == "late_result" and f["outcome"] == "success"
+               and f["node_id"] == "m" for f in recovered["followups"])
+
+    # 决定和执行均已落库，再次重启不会重复要求处置
+    Engine(Store(db), VirtualRobot())
+    assert Store(db).get_execution(eid2)["status"] == "succeeded"
     for execution in list(engine._executions.values()):
         execution.task.cancel()
+
+
+async def test_recovery_after_cancel_does_not_release_twice(tmp_path):
+    """已确认放下在重启恢复后不重复执行；既有取消决定和原故障保留。"""
+    db = tmp_path / "cleanup.db"
+    store = Store(db)
+    robot = VirtualRobot()
+    engine = Engine(store, robot)
+    robot.set_obstacle(True)
+    eid = engine.start("flow1", CLEANUP_FLOW)
+    await wait_until(lambda: any(e["type"] == "cleanup_started"
+                                 for e in store.get_events(eid)), timeout=12)
+    await asyncio.sleep(0.5)
+    assert engine.cancel(eid)
+    for execution in list(engine._executions.values()):
+        execution.task.cancel()
+    await asyncio.sleep(0.1)
+
+    class CountingRobot(VirtualRobot):
+        def __init__(self):
+            super().__init__()
+            self.release_calls = 0
+
+        async def release_if_holding(self, *args, **kwargs):
+            self.release_calls += 1
+            return await super().release_if_holding(*args, **kwargs)
+
+    store2 = Store(db)
+    robot2 = CountingRobot()
+    engine2 = Engine(store2, robot2)
+    record = store2.get_execution(eid)
+    assert record["status"] == "awaiting_recovery"
+    assert engine2.resolve_recovery(eid, finish=True)
+    await wait_until(lambda: store2.get_execution(eid)["status"] == "cancelled", timeout=8)
+    assert robot2.release_calls == 0
+    final = store2.get_execution(eid)
+    assert "障碍" in final["termination_reason"]
+    assert final["status"] == "cancelled"
+
+
+async def test_recovery_finish_continues_failure_sequence_without_repeat_release(tmp_path):
+    """失败收尾中途重启：人工选择继续后，跳过已确认放下，按原失败分支继续。"""
+    db = tmp_path / "continue-cleanup.db"
+    store = Store(db)
+    robot = VirtualRobot()
+    engine = Engine(store, robot)
+    held_flow = {
+        "nodes": [
+            {"id": "p", "type": "pick", "label": "取物", "params": {"item": "包裹"}},
+            {"id": "place", "type": "place", "label": "放置",
+             "params": {"max_retries": 0}},
+            {"id": "r", "type": "log", "label": "失败分支",
+             "params": {"message": "fail"}},
+        ],
+        "edges": [
+            {"id": "1", "source": "p", "target": "place", "kind": "success"},
+            {"id": "2", "source": "place", "target": "r", "kind": "exhausted"},
+        ],
+    }
+    async def fail_place(*args, **kwargs):
+        robot.state.holding = "包裹"
+        raise ActionFailed("放置台状态无法确认")
+    robot.place = fail_place
+    eid = engine.start("flow1", held_flow)
+    await wait_until(lambda: any(e["type"] == "cleanup_started"
+                                 for e in store.get_events(eid)), timeout=6)
+    await wait_until(lambda: robot.status()["holding"] is None, timeout=6)
+    for execution in list(engine._executions.values()):
+        execution.task.cancel()
+    await asyncio.sleep(0.1)
+
+    class CountingRobot(VirtualRobot):
+        def __init__(self):
+            super().__init__()
+            self.release_calls = 0
+
+        async def release_if_holding(self, *args, **kwargs):
+            self.release_calls += 1
+            return await super().release_if_holding(*args, **kwargs)
+
+    store2 = Store(db)
+    robot2 = CountingRobot()
+    engine2 = Engine(store2, robot2)
+    assert store2.get_execution(eid)["status"] == "awaiting_recovery"
+    assert engine2.resolve_recovery(eid, finish=True)
+    await wait_until(lambda: store2.get_execution(eid)["status"] == "succeeded", timeout=10)
+    assert robot2.release_calls == 0
+    final = store2.get_execution(eid)
+    assert (robot2.status()["x"], robot2.status()["y"]) == (0.0, 0.0)
+    assert any(nr["node_id"] == "r" and nr["status"] == "succeeded"
+               for nr in final["node_runs"])
+    assert any(f["kind"] == "cleanup" and f["outcome"] == "succeeded"
+               for f in final["followups"])

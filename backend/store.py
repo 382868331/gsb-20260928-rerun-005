@@ -64,6 +64,11 @@ class Store:
                     detail TEXT,
                     created_at TEXT NOT NULL DEFAULT (datetime('now'))
                 );
+                CREATE TABLE IF NOT EXISTS recovery_states(
+                    execution_id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
                 """
             )
             # 旧库升级：补充终止原因列
@@ -295,9 +300,42 @@ class Store:
         return [dict(r) for r in rows]
 
     def mark_stale_running(self) -> None:
-        """进程重启后，把遗留的运行/等待中执行标记为 interrupted。"""
+        """进程重启后，活动执行先停在人工待核实状态，而不是直接判中断。"""
         with self._lock, self._conn:
             self._conn.execute(
-                "UPDATE executions SET status='interrupted' "
-                "WHERE status IN ('running','paused','waiting','cancelling','awaiting_manual')"
+                "UPDATE executions SET status='awaiting_recovery', "
+                "termination_reason=COALESCE(termination_reason, '进程重启，设备状态待人工核实'), "
+                "updated_at=datetime('now') "
+                "WHERE status IN ('running','paused','waiting','cancelling')"
+            )
+
+    def save_recovery_state(self, execution_id: str, state: dict[str, Any]) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO recovery_states(execution_id,state) VALUES(?,?) "
+                "ON CONFLICT(execution_id) DO UPDATE SET state=excluded.state, "
+                "updated_at=datetime('now')",
+                (execution_id, json.dumps(state, ensure_ascii=False)),
+            )
+
+    def get_recovery_state(self, execution_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT state FROM recovery_states WHERE execution_id=?",
+                (execution_id,),
+            ).fetchone()
+        return json.loads(row["state"]) if row else None
+
+    def list_recovery_states(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT execution_id,state FROM recovery_states"
+            ).fetchall()
+        return [{"execution_id": r["execution_id"], **json.loads(r["state"])} for r in rows]
+
+    def delete_recovery_state(self, execution_id: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM recovery_states WHERE execution_id=?",
+                (execution_id,),
             )

@@ -8,7 +8,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 
 from .engine import Engine
-from .schemas import FlowIn, LateFinishIn, ManualResolveIn, ObstacleIn
+from .schemas import FlowIn, LateActionIn, LateFinishIn, ManualResolveIn, ObstacleIn, RecoveryResolveIn
 from .simulator import VirtualRobot
 from .store import Store
 
@@ -126,6 +126,22 @@ async def resolve_manual(execution_id: str, payload: ManualResolveIn):
     return {"status": "aborted" if payload.abort else "resolved"}
 
 
+@app.post("/api/executions/{execution_id}/recovery")
+async def resolve_recovery(execution_id: str, payload: RecoveryResolveIn):
+    if not app.state.engine.resolve_recovery(execution_id, finish=payload.finish):
+        raise HTTPException(409, "当前没有待核实的恢复处置")
+    return {"status": "finishing" if payload.finish else "resolved"}
+
+
+@app.post("/api/executions/{execution_id}/late-action")
+async def record_late_action(execution_id: str, payload: LateActionIn):
+    if not app.state.engine.record_late_action(
+        execution_id, payload.outcome, payload.detail
+    ):
+        raise HTTPException(409, "当前无法记录该迟到回应")
+    return {"status": payload.outcome}
+
+
 @app.get("/api/executions")
 async def list_executions():
     return app.state.store.list_executions()
@@ -138,10 +154,21 @@ async def get_execution(execution_id: str):
         raise HTTPException(404, "执行记录不存在")
     record["robot"] = app.state.robot.status()
     execution = app.state.engine.get(execution_id)
-    record["waiting_for"] = execution.wait_condition if execution else None
-    record["manual_node"] = execution.manual_node if execution else None
-    record["current_node"] = execution.current_node if execution else None
-    record["current_attempt"] = execution.current_attempt if execution else 0
+    state = app.state.store.get_recovery_state(execution_id) or {}
+    record["waiting_for"] = execution.wait_condition if execution else state.get("wait_condition")
+    record["manual_node"] = execution.manual_node if execution else state.get("manual_node")
+    record["current_node"] = execution.current_node if execution else state.get("current_node")
+    record["current_attempt"] = execution.current_attempt if execution else state.get("current_attempt", 0)
+    record["recovery"] = state
+    if record["status"] == "awaiting_recovery":
+        record["robot"] = state.get("last_robot", record["robot"])
+        record["unconfirmed_action"] = {
+            "node_id": state.get("current_node"),
+            "attempt": state.get("current_attempt"),
+            "phase": state.get("phase"),
+            "failure_detail": state.get("failure_detail"),
+            "last_progress": state.get("last_progress"),
+        }
     return record
 
 

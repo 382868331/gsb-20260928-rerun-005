@@ -48,6 +48,14 @@ export interface Execution {
   manual_node?: string | null;
   current_node?: string | null;
   current_attempt?: number;
+  recovery?: Record<string, unknown> | null;
+  unconfirmed_action?: {
+    node_id?: string | null;
+    attempt?: number | null;
+    phase?: string | null;
+    failure_detail?: string | null;
+    last_progress?: Record<string, unknown> | null;
+  } | null;
   robot: { x: number; y: number; holding: string | null; idle: boolean; obstacle: boolean };
 }
 

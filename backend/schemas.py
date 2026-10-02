@@ -49,3 +49,12 @@ class LateFinishIn(BaseModel):
 
 class ManualResolveIn(BaseModel):
     abort: bool = False
+
+
+class RecoveryResolveIn(BaseModel):
+    finish: bool = False
+
+
+class LateActionIn(BaseModel):
+    outcome: Literal["success", "failure"] = "success"
+    detail: str = "设备迟到回应"

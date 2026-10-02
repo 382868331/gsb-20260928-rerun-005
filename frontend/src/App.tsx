@@ -9,6 +9,7 @@ const STATUS_TEXT: Record<string, string> = {
   paused: '已暂停',
   cancelling: '取消中（动作收尾）',
   awaiting_manual: '等待人工处置',
+  awaiting_recovery: '待人工核实恢复',
   succeeded: '成功',
   failed: '失败',
   cancelled: '已取消',
@@ -16,7 +17,7 @@ const STATUS_TEXT: Record<string, string> = {
   interrupted: '中断',
 };
 
-const TERMINAL = new Set(['succeeded', 'failed', 'cancelled', 'interrupted']);
+const TERMINAL = new Set(['succeeded', 'failed', 'cancelled', 'interrupted', 'resolved']);
 
 export default function App() {
   const [flows, setFlows] = useState<Flow[]>([]);
@@ -112,6 +113,10 @@ export default function App() {
   const manualNode = manualNodeId
     ? flow?.definition.nodes.find((n) => n.id === manualNodeId) ?? null
     : null;
+  const recoveryNodeId = execution?.unconfirmed_action?.node_id;
+  const recoveryNode = recoveryNodeId
+    ? flow?.definition.nodes.find((n) => n.id === recoveryNodeId) ?? null
+    : null;
 
   return (
     <div className="app">
@@ -133,7 +138,7 @@ export default function App() {
         >⏵ 恢复</button>
         <button
           onClick={() => runAction(() => api.cancel(execution!.id))}
-          disabled={!active || execution?.status === 'cancelling'}
+          disabled={!active || execution?.status === 'cancelling' || execution?.status === 'awaiting_recovery'}
           className="btn-danger"
         >⊘ 取消（动作收尾）</button>
         <button onClick={toggleObstacle} className={obstacle ? 'btn-warn active' : 'btn-warn'}>
@@ -169,6 +174,29 @@ export default function App() {
                 className="btn-danger"
                 onClick={() => runAction(() => api.resolveManual(execution.id, true))}
               >确认终止，流程停在此处</button>
+            </div>
+          )}
+          {execution?.status === 'awaiting_recovery' && (
+            <div className="manual-bar recovery-bar">
+              <span className="manual-bar__title">
+                🛠 设备状态待核实：持有物「{execution.robot.holding ?? '空'}」，
+                最后位置 ({execution.robot.x}, {execution.robot.y})，
+                未确认动作：{recoveryNode?.label ?? recoveryNodeId ?? '无'}
+                {execution.unconfirmed_action?.attempt ? `（第${execution.unconfirmed_action.attempt}次）` : ''}
+                {execution.unconfirmed_action?.failure_detail ? `；原故障：${execution.unconfirmed_action.failure_detail}` : ''}
+              </span>
+              <button
+                className="btn-secondary"
+                onClick={() => runAction(() => api.recordLateAction(execution.id, 'success', '现场确认原动作已完成'))}
+              >登记迟到成功（不发新移动）</button>
+              <button
+                className="btn-primary"
+                onClick={() => runAction(() => api.resolveRecovery(execution.id, true))}
+              >继续收尾</button>
+              <button
+                className="btn-danger"
+                onClick={() => runAction(() => api.resolveRecovery(execution.id, false))}
+              >结束本次流程</button>
             </div>
           )}
           {flow && (

@@ -9,6 +9,7 @@ from .store import Store
 
 
 TERMINAL = {"succeeded", "failed", "cancelled", "interrupted", "resolved"}
+RECOVERY_STATUS = "awaiting_recovery"
 
 
 @dataclass
@@ -33,9 +34,12 @@ class Execution:
     termination_reason: str | None = None
     cleanup_active: bool = False  # 是否正在执行失败收尾流程
     in_retry_loop: bool = False  # 是否已进入过失败回路
+    recovery_state: dict | None = None
+    active_definition: dict | None = None
 
     def next_node(self, node_id: str, kind: str) -> str | None:
-        for edge in self.definition.get("edges", []):
+        definition = self.active_definition or self.definition
+        for edge in definition.get("edges", []):
             if edge["source"] == node_id and edge.get("kind", "success") == kind:
                 return edge["target"]
         return None
@@ -48,6 +52,19 @@ class Engine:
         self._executions: dict[str, Execution] = {}
         self._subscribers: set[asyncio.Queue] = set()
         store.mark_stale_running()
+        for state in store.list_recovery_states():
+            if store.get_execution(state["execution_id"])["status"] in (
+                RECOVERY_STATUS, "awaiting_manual"
+            ):
+                execution = self._hydrate_execution(state)
+                self._executions[execution.id] = execution
+                record = store.get_execution(execution.id)
+                decision = ("manual_" + state.get("manual_decision")
+                            if record["status"] == "awaiting_manual"
+                            and state.get("manual_decision") is not None
+                            else state.get("recovery_decision"))
+                if decision is not None:
+                    execution.task = asyncio.create_task(self._recover(execution, decision))
 
     async def subscribe(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=256)
@@ -72,11 +89,48 @@ class Engine:
     def _set_status(self, execution_id: str, status: str) -> None:
         self.store.set_execution_status(execution_id, status)
 
+    def _save_checkpoint(self, execution: Execution, **changes: object) -> None:
+        state = getattr(execution, "recovery_state", {}) or {}
+        state.update({key: value for key, value in changes.items() if value is not None})
+        state.update({
+            "flow_id": execution.flow_id,
+            "definition": execution.definition,
+            "current_node": execution.current_node,
+            "current_attempt": execution.current_attempt,
+            "attempts": execution.attempts,
+            "in_retry_loop": execution.in_retry_loop,
+            "cancel_requested": execution.stop.is_set(),
+            "cancel_phase": execution.cancel_phase,
+            "wait_condition": execution.wait_condition,
+        })
+        state.setdefault("last_robot", self.robot.status())
+        execution.recovery_state = state
+        self.store.save_recovery_state(execution.id, state)
+
+    def _hydrate_execution(self, state: dict) -> Execution:
+        execution = Execution(
+            id=state["execution_id"], flow_id=state["flow_id"],
+            definition=state["definition"])
+        execution.current_node = state.get("current_node")
+        execution.current_attempt = int(state.get("current_attempt") or 0)
+        execution.attempts = {k: int(v) for k, v in (state.get("attempts") or {}).items()}
+        execution.in_retry_loop = bool(state.get("in_retry_loop"))
+        execution.cancel_phase = state.get("cancel_phase")
+        execution.wait_condition = state.get("wait_condition")
+        execution.manual_node = state.get("manual_node")
+        execution.recovery_state = state
+        execution.resume.set()
+        if state.get("cancel_requested"):
+            execution.stop.set()
+        return execution
+
     def start(self, flow_id: str, definition: dict) -> str:
         execution_id = uuid.uuid4().hex[:12]
         self.store.create_execution(execution_id, flow_id)
         execution = Execution(id=execution_id, flow_id=flow_id, definition=definition)
         self._executions[execution_id] = execution
+        execution.recovery_state = {"execution_id": execution_id, "phase": "starting"}
+        self._save_checkpoint(execution, phase="starting")
         execution.task = asyncio.create_task(self._run(execution))
         return execution_id
 
@@ -109,11 +163,12 @@ class Engine:
     def cancel(self, execution_id: str) -> bool:
         execution = self._executions.get(execution_id)
         record = self.store.get_execution(execution_id)
-        if not record or record["status"] in TERMINAL:
+        if not execution or not record or record["status"] in TERMINAL or record["status"] == RECOVERY_STATUS:
             return False
         execution.stop.set()
         execution.resume.set()  # 唤醒暂停中的任务，让它响应取消
         execution.condition_met.set()
+        self._save_checkpoint(execution, cancel_requested=True)
         self._set_status(execution_id, "cancelling")
         self._emit(execution_id, "execution_cancelling",
                    message="取消请求已送达，等待当前动作收尾")
@@ -130,10 +185,34 @@ class Engine:
 
     def resolve_manual(self, execution_id: str, abort: bool = False) -> bool:
         execution = self._executions.get(execution_id)
-        if not execution or execution.manual_node is None:
+        record = self.store.get_execution(execution_id)
+        if not execution or not record:
+            return False
+        if execution.manual_node is None and record["status"] != "awaiting_manual":
+            return False
+        if (execution.recovery_state or {}).get("manual_decision") is not None:
             return False
         execution.manual_abort = abort
         execution.manual_resolution.set()
+        self._save_checkpoint(execution, phase="manual",
+                              current_node=execution.manual_node, manual_node=execution.manual_node,
+                              manual_decision="abort" if abort else "continue")
+        if record["status"] == "awaiting_manual" and execution.task is None:
+            execution.task = asyncio.create_task(
+                self._recover(execution, "manual_abort" if abort else "manual_continue"))
+        return True
+
+    def resolve_recovery(self, execution_id: str, finish: bool) -> bool:
+        execution = self._executions.get(execution_id)
+        record = self.store.get_execution(execution_id)
+        if not execution or not record or record["status"] != RECOVERY_STATUS:
+            return False
+        decision = "finish" if finish else "abort"
+        state = execution.recovery_state or {}
+        if state.get("recovery_decision") is not None:
+            return False
+        self._save_checkpoint(execution, recovery_decision=decision)
+        execution.task = asyncio.create_task(self._recover(execution, decision))
         return True
 
     async def _gate(self, execution: Execution) -> None:
@@ -143,13 +222,193 @@ class Engine:
             except TimeoutError:
                 pass
 
-    async def _run(self, execution: Execution) -> None:
+    def record_late_action(self, execution_id: str, outcome: str, detail: str) -> bool:
+        execution = self._executions.get(execution_id)
+        record = self.store.get_execution(execution_id)
+        if not execution or not record or record["status"] != RECOVERY_STATUS:
+            return False
+        node_id = execution.current_node
+        attempt = execution.current_attempt
+        if not node_id or not attempt:
+            return False
+        self.store.add_node_followup(
+            execution_id, node_id, attempt, "late_result", outcome, detail)
+        self._emit(execution_id, "late_result_recorded", node_id,
+                   f"重启核实期间收到的迟到结果（{outcome}）仅补充到旧执行：{detail}",
+                   data={"attempt": attempt, "outcome": outcome, "detail": detail,
+                         "recovery": True})
+        self._save_checkpoint(execution, late_action_outcome=outcome,
+                              late_action_detail=detail)
+        return True
+
+    async def _recover(self, execution: Execution, decision: str) -> None:
         eid = execution.id
-        self._emit(eid, "execution_started", message="任务开始",
-                   data={"flow_id": execution.flow_id})
-        nodes = {n["id"]: n for n in execution.definition["nodes"]}
-        incoming = {e["target"] for e in execution.definition.get("edges", [])}
-        starters = [n["id"] for n in execution.definition["nodes"]
+        state = execution.recovery_state or {}
+        self._emit(eid, "recovery_decision_saved",
+                   message=f"恢复处置已保存：{decision}", data={"decision": decision})
+        last_robot = state.get("last_robot") or self.robot.status()
+        self.robot.state.x = float(last_robot.get("x", 0))
+        self.robot.state.y = float(last_robot.get("y", 0))
+        self.robot.state.holding = last_robot.get("holding")
+        self.robot.state.idle = True
+
+        phase = state.get("phase")
+        failure_detail = state.get("failure_detail")
+        reason = f"人工恢复处置：{decision}"
+        if failure_detail:
+            reason += f"；原故障：{failure_detail}"
+
+        if decision == "abort":
+            self.store.set_execution_status(eid, "resolved", reason)
+            self._emit(eid, "execution_finished", message="人工核实后结束流程",
+                       data={"status": "resolved", "reason": reason})
+            self.store.delete_recovery_state(eid)
+            return
+
+        if phase == "manual":
+            node_id = state.get("manual_node") or state.get("current_node")
+            if decision == "manual_abort":
+                self.store.finish_node_run(eid, node_id, 1, "aborted", "重启后人工确认终止")
+                self.store.set_execution_status(eid, "resolved", "重启后人工确认终止")
+                self._emit(eid, "execution_finished", message="人工确认终止，流程停在此处",
+                           data={"status": "resolved", "reason": "重启后人工确认终止"})
+                self.store.delete_recovery_state(eid)
+                return
+            self.store.finish_node_run(eid, node_id, 1, "succeeded", "重启后人工确认继续")
+            self._set_status(eid, "running")
+            resume_definition = self._tail_definition(execution, node_id, "success")
+            await self._run(execution, resume_definition=resume_definition,
+                            emit_started=False)
+            return
+
+        if phase == "waiting":
+            self._set_status(eid, "waiting")
+            execution.wait_condition = state.get("wait_condition")
+            self._emit(eid, "recovery_waiting", message="恢复到原等待条件；未发出新的移动")
+            execution.task = asyncio.current_task()
+            node_id = state.get("current_node")
+            node = next(n for n in execution.definition["nodes"] if n["id"] == node_id)
+            kind, detail = await self._execute_node(
+                execution, node, int(state.get("current_attempt", 1)))
+            if kind != "success":
+                final_status = "cancelled" if kind == "cancelled" else "resolved"
+                wait_reason = f"人工核实后结束流程；等待结果：{detail}"
+                self.store.set_execution_status(eid, final_status, wait_reason)
+                self._emit(eid, "execution_finished", message="人工核实后结束流程",
+                           data={"status": final_status, "reason": wait_reason})
+                self.store.delete_recovery_state(eid)
+                return
+            self.store.finish_node_run(
+                eid, node_id, int(state.get("current_attempt", 1)), "succeeded", detail)
+            resume_definition = self._tail_definition(execution, node_id, "success")
+            await self._run(execution, resume_definition=resume_definition,
+                            emit_started=False)
+            return
+
+        if phase == "failure_cleanup":
+            self._set_status(eid, "running")
+            failed_node = next(n for n in execution.definition["nodes"]
+                               if n["id"] == state.get("failed_node"))
+            await self._run_failure_cleanup(
+                execution, failed_node, int(state.get("failure_attempt", 1)),
+                failure_detail, resuming=True)
+            if execution.stop.is_set():
+                final_reason = f"人工确认继续完成收尾后结束；原故障：{failure_detail}"
+                self.store.set_execution_status(eid, "cancelled", final_reason)
+                self._emit(eid, "execution_finished",
+                           message="收尾完成，既有取消决定继续生效",
+                           data={"status": "cancelled", "reason": final_reason})
+                self.store.delete_recovery_state(eid)
+                return
+            resume_definition = self._failure_tail_definition(
+                execution, failed_node["id"],
+                int(state.get("failure_attempt", 1)), failed_node)
+            await self._run(execution, resume_definition=resume_definition,
+                            emit_started=False)
+            return
+
+        node_id = state.get("current_node")
+        attempt = int(state.get("current_attempt", 1))
+        late = state.get("late_action_outcome")
+        if late == "success":
+            self._set_status(eid, "running")
+            self.store.finish_node_run_guarded(
+                eid, node_id, attempt, "succeeded",
+                state.get("late_action_detail", "重启后由设备迟到回应确认完成"))
+            resume_definition = self._tail_definition(execution, node_id, "success")
+            await self._run(execution, resume_definition=resume_definition,
+                            emit_started=False)
+            return
+
+        if execution.stop.is_set():
+            if node_id:
+                uncertain = next(n for n in execution.definition["nodes"]
+                                 if n["id"] == node_id)
+                await self._run_failure_cleanup(
+                    execution, uncertain, attempt,
+                    state.get("late_action_detail") or "重启前取消中的动作结果无法确认",
+                    resuming=True)
+            cancel_reason = "人工确认继续收尾；取消决定继续生效"
+            if failure_detail:
+                prefix = "原故障：" if phase == "failure_cleanup" else "未确认动作："
+                cancel_reason += f"；{prefix}{failure_detail}"
+            self.store.set_execution_status(eid, "cancelled", cancel_reason)
+            self._emit(eid, "execution_finished", message="收尾完成，取消决定继续生效",
+                       data={"status": "cancelled", "reason": cancel_reason})
+            self.store.delete_recovery_state(eid)
+            return
+
+        if node_id:
+            failed_node = next(n for n in execution.definition["nodes"]
+                               if n["id"] == node_id)
+            self.store.add_node_followup(
+                eid, node_id, attempt, "recovery", "aborted",
+                "设备动作无法确认，人工选择结束；不重复执行该动作")
+            await self._run_failure_cleanup(
+                execution, failed_node, attempt,
+                state.get("late_action_detail") or "重启前动作结果无法确认",
+                resuming=True)
+        self.store.set_execution_status(eid, "resolved", reason)
+        self._emit(eid, "execution_finished", message="人工核实后结束流程",
+                   data={"status": "resolved", "reason": reason})
+        self.store.delete_recovery_state(eid)
+
+    def _tail_definition(self, execution: Execution, node_id: str, kind: str) -> dict:
+        target = execution.next_node(node_id, kind)
+        reachable = set()
+        if target:
+            stack = [target]
+            while stack:
+                current = stack.pop()
+                if current in reachable:
+                    continue
+                reachable.add(current)
+                for edge in execution.definition.get("edges", []):
+                    if edge["source"] == current:
+                        stack.append(edge["target"])
+        nodes = [n for n in execution.definition["nodes"] if n["id"] in reachable]
+        edges = [e for e in execution.definition.get("edges", [])
+                 if e["source"] in reachable and e["target"] in reachable]
+        return {"nodes": nodes, "edges": edges}
+
+    def _failure_tail_definition(self, execution: Execution, node_id: str,
+                                 attempt: int, node: dict) -> dict:
+        max_retries = int(node.get("params", {}).get("max_retries", 3))
+        kind = "failure" if attempt <= max_retries else "exhausted"
+        return self._tail_definition(execution, node_id, kind)
+
+    async def _run(self, execution: Execution,
+                   resume_definition: dict | None = None,
+                   emit_started: bool = True) -> None:
+        eid = execution.id
+        definition = resume_definition or execution.definition
+        execution.active_definition = definition
+        if emit_started:
+            self._emit(eid, "execution_started", message="任务开始",
+                       data={"flow_id": execution.flow_id})
+        nodes = {n["id"]: n for n in definition["nodes"]}
+        incoming = {e["target"] for e in definition.get("edges", [])}
+        starters = [n["id"] for n in definition["nodes"]
                     if n["id"] not in incoming]
         current = starters[0] if starters else None
         final_status = "succeeded"
@@ -175,6 +434,10 @@ class Engine:
                 execution.current_node = current
                 execution.current_attempt = attempt
                 self.store.start_node_run(eid, current, attempt)
+                self._save_checkpoint(
+                    execution, phase="action",
+                    completed_cleanup_stages=[], cleanup_next_stage="release",
+                    wait_condition=None)
                 self._emit(eid, "node_started", current,
                            f"第 {attempt} 次开始：{node.get('label') or current}",
                            data={"attempt": attempt})
@@ -185,6 +448,8 @@ class Engine:
                 if kind in ("success", "failure") and execution.stop.is_set():
                     if execution.cancel_phase is None:
                         execution.cancel_phase = "重试回路" if execution.in_retry_loop else "动作收尾"
+                    self._save_checkpoint(
+                        execution, failure_detail=f"取消时动作结果尚未确认：{detail}")
                     stored = self.store.node_run_status(eid, current, attempt)
                     self.store.finish_node_run_guarded(
                         eid, current, attempt, "cancelled", "取消决定已生效，等待动作收尾")
@@ -203,6 +468,8 @@ class Engine:
                 if kind == "cancelled":
                     if execution.cancel_phase is None:
                         execution.cancel_phase = "重试回路" if execution.in_retry_loop else "动作收尾"
+                    self._save_checkpoint(
+                        execution, failure_detail=f"取消时动作结果尚未确认：{detail}")
                     self.store.finish_node_run_guarded(
                         eid, current, attempt, "cancelled", detail)
                     self._emit(eid, "node_cancelled", current,
@@ -221,8 +488,12 @@ class Engine:
                     # 失败后先走收尾流程（放下持有物 → 返回安全位置）。
                     # 收尾自身的成功/失败/取消只作为可追溯信息，
                     # 绝不覆盖本次失败原因，也不改变重试/分支决定。
+                    self._save_checkpoint(
+                        execution, phase="failure_cleanup", failed_node=current,
+                        failure_attempt=attempt, failure_detail=failure_detail,
+                        completed_cleanup_stages=[], cleanup_next_stage="release")
                     cancelled_in_cleanup = await self._run_failure_cleanup(
-                        execution, node, attempt, failure_detail)
+                        execution, node, attempt, failure_detail, resuming=False)
                     if execution.stop.is_set() or cancelled_in_cleanup:
                         execution.cancel_phase = "失败收尾"
                         self._emit(
@@ -257,6 +528,9 @@ class Engine:
                     current = target
                     continue
                 self.store.finish_node_run(eid, current, attempt, "succeeded", detail)
+                self._save_checkpoint(execution, phase="node_succeeded",
+                                      last_completed_node=current,
+                                      completed_cleanup_stages=[])
                 if attempt > 1:
                     self._emit(eid, "node_succeeded", current,
                                f"第 {attempt} 次尝试成功：{node.get('label') or current}",
@@ -271,6 +545,7 @@ class Engine:
             execution.current_attempt = 0
             reason = self._termination_reason(execution, final_status)
             self.store.set_execution_status(eid, final_status, reason)
+            self.store.delete_recovery_state(eid)
             execution.final_status = final_status
             execution.termination_reason = reason
             self._emit(eid, "execution_finished",
@@ -309,6 +584,7 @@ class Engine:
     async def _run_failure_cleanup(
         self, execution: Execution, failed_node: dict, attempt: int,
         failure_detail: str | None,
+        resuming: bool = False,
     ) -> bool:
         """失败后的收尾流程：就地放下持有物 → 返回安全位置。
 
@@ -330,20 +606,29 @@ class Engine:
         async def gate_steps() -> None:
             await self._gate(execution)
 
-        # 收尾流程定义：放下持有物 → 返回安全位置。暂停仍然生效。
         stop = execution.stop
-        stages: list[tuple[str, Awaitable[object], str]] = [
-            ("release", self.robot.release_if_holding(
-                cleanup_progress, stop, gate_steps), "放下持有物"),
-            ("return", self.robot.return_to_safe(
-                cleanup_progress, stop, gate_steps), "返回安全位置"),
-        ]
+        completed = set((execution.recovery_state or {}).get("completed_cleanup_stages") or [])
+        all_stages = [("release", "放下持有物"), ("return", "返回安全位置")]
+        if resuming:
+            stages = [(stage, label) for stage, label in all_stages if stage not in completed]
+            if stages:
+                self._emit(eid, "cleanup_resuming", node_id,
+                           f"人工确认继续收尾；已完成阶段：{', '.join(sorted(completed)) or '无'}；"
+                           f"待确认阶段：{', '.join(label for _, label in stages)}",
+                           data={"attempt": attempt, "completed": sorted(completed)})
+            else:
+                self._emit(eid, "cleanup_resumed_already_complete", node_id,
+                           "收尾阶段均已确认完成，不重复放下或移动",
+                           data={"attempt": attempt})
+                return False
+        else:
+            stages = all_stages
         self._emit(eid, "cleanup_started", node_id,
                    f"第 {attempt} 次失败后开始收尾：放下持有物 → 返回安全位置；"
                    f"原失败原因：{failure_detail}",
                    data={"attempt": attempt, "failure_detail": failure_detail})
         cancelled = False
-        for idx, (stage, coro, label) in enumerate(stages):
+        for idx, (stage, label) in enumerate(stages):
             await self._gate(execution)
             # idx==0 且 stop 未置位：正常启动收尾。
             # idx==0 且 stop 已置位：取消发生在重试/等待阶段（收尾从未开始），不启动收尾。
@@ -366,7 +651,12 @@ class Engine:
                 break
             execution.cleanup_active = True
             try:
-                result = await coro
+                if stage == "release":
+                    result = await self.robot.release_if_holding(
+                        cleanup_progress, stop, gate_steps)
+                else:
+                    result = await self.robot.return_to_safe(
+                        cleanup_progress, stop, gate_steps)
             except ActionCancelled as exc:
                 self.store.add_node_followup(
                     eid, node_id, attempt, "cleanup", "cancelled", f"{label}：{exc}")
@@ -396,6 +686,11 @@ class Engine:
                     cancelled = True
                     break
                 continue
+            completed.add(stage)
+            self._save_checkpoint(
+                execution, completed_cleanup_stages=sorted(completed),
+                cleanup_next_stage="return" if stage == "release" else None,
+                last_robot=self.robot.status())
             if stage == "return":
                 sx, sy = result  # type: ignore[misc]
                 self.store.add_node_followup(
@@ -418,6 +713,11 @@ class Engine:
         instruction = node.get("params", {}).get("instruction", "等待人工处置")
         self.store.start_node_run(eid, node_id, 1)
         self.store.update_node_run(eid, node_id, 1, "manual", instruction)
+        execution.manual_node = node_id
+        execution.manual_abort = False
+        self._save_checkpoint(execution, phase="manual", current_node=node_id,
+                              current_attempt=1, manual_node=node_id,
+                              manual_decision=None)
         self._set_status(eid, "awaiting_manual")
         self._emit(eid, "node_manual_required", node_id,
                    f"停在人工处置节点：{node.get('label') or node_id}（{instruction}）",
@@ -437,6 +737,8 @@ class Engine:
             self._emit(eid, "node_manual_aborted", node_id, "人工确认终止，流程停在此处")
             return None
         self.store.finish_node_run(eid, node_id, 1, "succeeded", "人工处置完成，继续执行")
+        self._save_checkpoint(execution, current_node=node_id,
+                              completed_cleanup_stages=[])
         self._emit(eid, "node_manual_resolved", node_id, "人工处置完成，流程继续")
         return execution.next_node(node_id, "success")
 
@@ -446,6 +748,9 @@ class Engine:
         params = node.get("params", {})
 
         async def progress(data: dict) -> None:
+            self._save_checkpoint(execution, last_progress=data,
+                                  last_robot={**data, "obstacle": self.robot.obstacle}
+                                  if "x" in data else None)
             self._emit(eid, "node_progress", node["id"],
                        data={**data, "attempt": attempt, "robot": self.robot.status()})
 
@@ -461,6 +766,9 @@ class Engine:
             execution.condition_met.clear()
             self.store.mark_node_run_waiting(eid, node["id"], attempt,
                                              f"等待条件：{condition}")
+            self._save_checkpoint(
+                execution, phase="waiting", current_node=node["id"],
+                current_attempt=attempt, wait_condition=condition)
             self._emit(eid, "node_waiting", node["id"],
                        f"第 {attempt} 次等待条件：{condition}",
                        data={"attempt": attempt})
@@ -486,6 +794,9 @@ class Engine:
                         execution.cancel_phase = "等待条件"
                         return "cancelled", "等待期间被取消"
                     self._set_status(eid, "running")
+                    self._save_checkpoint(execution, phase="condition_met",
+                                          wait_condition=None,
+                                          last_robot=self.robot.status())
                     return "success", f"条件 {condition} 已满足"
             finally:
                 execution.wait_condition = None

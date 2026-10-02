@@ -41,6 +41,7 @@
 .badge-cancelled { background: #525252; }
 .badge-interrupted { background: #7c2d12; }
 .badge-awaiting_manual { background: #9333ea; }
+.badge-awaiting_recovery { background: #0e7490; }
 .badge-resolved { background: #6b21a8; }
 
 .manual-bar {
@@ -51,6 +52,8 @@
 .manual-bar button { border-radius: 6px; padding: 5px 12px; font-size: 12px; cursor: pointer; border: 1px solid; }
 .manual-bar .btn-primary { background: #2563eb; border-color: #2563eb; color: #fff; }
 .manual-bar .btn-danger { background: #b91c1c; border-color: #b91c1c; color: #fff; }
+.manual-bar .btn-secondary { background: #ecfeff; border-color: #0e7490; color: #0e7490; }
+.recovery-bar { background: #ecfeff; border-bottom-color: #67e8f9; color: #164e63; }
 
 .sidebar { width: 360px; border-left: 1px solid #e5e7eb; display: flex; flex-direction: column; }
 .panel { padding: 14px 16px; border-bottom: 1px solid #e5e7eb; }
