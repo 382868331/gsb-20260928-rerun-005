@@ -512,3 +512,208 @@ async def test_recovery_finish_continues_failure_sequence_without_repeat_release
                for nr in final["node_runs"])
     assert any(f["kind"] == "cleanup" and f["outcome"] == "succeeded"
                for f in final["followups"])
+
+
+# ---- 核实证据逐项登记/修订（followup150-005）----
+
+
+async def _crash(engine):
+    for execution in list(engine._executions.values()):
+        execution.task.cancel()
+    await asyncio.sleep(0.1)
+
+
+RECOVER_MOVE_FLOW = {
+    "nodes": [
+        {"id": "m", "type": "move", "label": "移动", "params": {"x": 6, "y": 0}},
+        {"id": "n", "type": "log", "label": "下一步", "params": {"message": "go"}},
+    ],
+    "edges": [{"id": "1", "source": "m", "target": "n", "kind": "success"}],
+}
+
+
+async def test_manual_observation_then_late_completion_stays_disputed(tmp_path):
+    """现场观察与稍后迟到完成互相矛盾：动作结果保持待决定，不自动接续。"""
+    from backend.evidence import resolve_ledger
+    db = tmp_path / "evidence.db"
+    engine = Engine(Store(db), VirtualRobot())
+    eid = engine.start("flow1", RECOVER_MOVE_FLOW)
+    await wait_until(
+        lambda: any(nr["node_id"] == "m" and nr["status"] == "running"
+                    for nr in engine.store.get_execution(eid)["node_runs"]))
+    await _crash(engine)
+
+    engine = Engine(Store(db), VirtualRobot())
+    store = engine.store
+    assert store.get_execution(eid)["status"] == "awaiting_recovery"
+    seeded = store.get_recovery_evidence(eid)
+    assert {e["subject"] for e in seeded} == {"position", "holding"}
+
+    engine.add_evidence(
+        eid, "action_result", "manual_observation", "2026-10-03T10:00:00+08:00",
+        "failure", "现场确认未到达")
+    assert engine.record_late_action(eid, "success", "旧动作迟到完成回应")
+    resolution = resolve_ledger(store.get_recovery_evidence(eid))
+    assert resolution["action_result"]["status"] == "disputed"
+
+    assert engine.resolve_recovery(eid, finish=True) is False
+    assert store.get_execution(eid)["status"] == "awaiting_recovery"
+    blocked = [e for e in store.get_events(eid)
+               if e["type"] == "recovery_decision_blocked"]
+    assert blocked[-1]["data"]["resolution"]["action_result"]["status"] == "disputed"
+
+
+async def test_withdraw_observation_then_late_completion_allows_continue(tmp_path):
+    """撤回现场观察后矛盾消失：按更新后的依据接续，且不重跑移动。"""
+    from backend.evidence import resolve_ledger
+    db = tmp_path / "evidence2.db"
+    engine = Engine(Store(db), VirtualRobot())
+    eid = engine.start("flow1", RECOVER_MOVE_FLOW)
+    await wait_until(
+        lambda: any(nr["node_id"] == "m" and nr["status"] == "running"
+                    for nr in engine.store.get_execution(eid)["node_runs"]))
+    await _crash(engine)
+
+    engine = Engine(Store(db), VirtualRobot())
+    store = engine.store
+    observation_id = engine.add_evidence(
+        eid, "action_result", "manual_observation", "2026-10-03T10:00:00+08:00",
+        "failure", "现场判断未完成")
+    engine.record_late_action(eid, "success", "设备确认移动完成")
+    assert resolve_ledger(store.get_recovery_evidence(eid))["action_result"]["status"] == "disputed"
+
+    assert engine.withdraw_evidence(eid, observation_id, "观察角度有误，撤回")
+    withdrawn = [e for e in store.get_recovery_evidence(eid) if e["id"] == observation_id][0]
+    assert withdrawn["status"] == "withdrawn"
+    resolution = resolve_ledger(store.get_recovery_evidence(eid))
+    assert resolution["action_result"]["status"] == "confirmed"
+    assert resolution["action_result"]["value"] == "success"
+
+    assert engine.resolve_recovery(eid, finish=True)
+    await wait_until(lambda: store.get_execution(eid)["status"] == "succeeded", timeout=8)
+    final = store.get_execution(eid)
+    assert [nr["status"] for nr in final["node_runs"] if nr["node_id"] == "m"] == ["succeeded"]
+    assert any(nr["node_id"] == "n" for nr in final["node_runs"])
+    saved = [e for e in store.get_events(eid) if e["type"] == "recovery_decision_saved"]
+    assert set(saved[-1]["data"]["basis"]) >= {"holding", "action_result"}
+
+
+async def test_evidence_correction_after_decision_reawaits_unissued_action(tmp_path):
+    """决定保存后证据被更正：尚未发出的后续动作重新等待确认，每次决定只推进一次。"""
+    db = tmp_path / "evidence3.db"
+    engine = Engine(Store(db), VirtualRobot())
+    flow = {
+        "nodes": [
+            {"id": "m", "type": "move", "label": "首步移动", "params": {"x": 1, "y": 0}},
+            {"id": "m2", "type": "move", "label": "后续移动", "params": {"x": 9, "y": 0}},
+        ],
+        "edges": [{"id": "1", "source": "m", "target": "m2", "kind": "success"}],
+    }
+    eid = engine.start("flow1", flow)
+    await wait_until(
+        lambda: any(nr["node_id"] == "m" and nr["status"] == "running"
+                    for nr in engine.store.get_execution(eid)["node_runs"]))
+    await _crash(engine)
+
+    engine = Engine(Store(db), VirtualRobot())
+    engine.decision_gate_delay = 0.8
+    store = engine.store
+    engine.record_late_action(eid, "success", "设备确认首步移动完成")
+    assert engine.resolve_recovery(eid, finish=True)
+    await wait_until(lambda: engine.get(eid).task is not None)
+    # 等恢复任务抵达“后续动作发出前”的第二个决定闸门
+    await asyncio.sleep(0.95)
+    holding_id = [e["id"] for e in store.get_recovery_evidence(eid)
+                  if e["subject"] == "holding" and e["status"] == "active"][0]
+    assert engine.withdraw_evidence(eid, holding_id, "现场无法确认是否持物")
+    await wait_until(
+        lambda: store.get_execution(eid)["status"] == "awaiting_recovery", timeout=6)
+    record = store.get_execution(eid)
+    # 尚未发出的后续移动 m2 不启动（动作结果在闸门确认后才会落定首步事实）
+    assert not any(nr["node_id"] == "m2" for nr in record["node_runs"])
+    events = store.get_events(eid)
+    assert any(e["type"] == "recovery_followups_blocked" for e in events)
+    assert any(e["type"] == "recovery_reawait_confirmation" for e in events)
+    assert store.get_recovery_state(eid)["recovery_decision"] is None
+
+    engine.add_evidence(eid, "holding", "manual_observation",
+                        "2026-10-03T10:05:00+08:00", "empty", "再次核实为空")
+    engine.add_evidence(eid, "action_result", "device_response",
+                        "2026-10-03T10:05:01+08:00", "success", "再次确认首步已完成")
+    engine.decision_gate_delay = 0
+    assert engine.resolve_recovery(eid, finish=True)
+    await wait_until(lambda: store.get_execution(eid)["status"] == "succeeded", timeout=8)
+    final = store.get_execution(eid)
+    assert [nr["status"] for nr in final["node_runs"] if nr["node_id"] == "m"] == ["succeeded"]
+    assert [nr["status"] for nr in final["node_runs"] if nr["node_id"] == "m2"] == ["succeeded"]
+
+
+async def test_holding_dispute_blocks_pick_and_release(tmp_path):
+    """持物归属有争议：不得再次取物/重复放下，操作者能看到受阻动作。"""
+    db = tmp_path / "evidence4.db"
+    engine = Engine(Store(db), VirtualRobot())
+    flow = {
+        "nodes": [
+            {"id": "p", "type": "pick", "label": "取物",
+             "params": {"item": "包裹", "max_retries": 0}},
+            {"id": "r", "type": "log", "label": "失败分支", "params": {"message": "x"}},
+        ],
+        "edges": [{"id": "1", "source": "p", "target": "r", "kind": "exhausted"}],
+    }
+    eid = engine.start("flow1", flow)
+    await wait_until(
+        lambda: any(nr["node_id"] == "p" and nr["status"] == "running"
+                    for nr in engine.store.get_execution(eid)["node_runs"]))
+    await _crash(engine)
+
+    class CountingRobot(VirtualRobot):
+        def __init__(self):
+            super().__init__()
+            self.release_calls = 0
+
+        async def release_if_holding(self, *a, **k):
+            self.release_calls += 1
+            return await super().release_if_holding(*a, **k)
+
+    robot = CountingRobot()
+    engine = Engine(Store(db), robot)
+    store = engine.store
+    engine.add_evidence(eid, "holding", "manual_observation",
+                        "2026-10-03T10:00:00+08:00", "包裹", "现场看到夹爪持有")
+    assert engine.resolve_recovery(eid, finish=False)
+    await asyncio.sleep(0.3)
+    assert store.get_execution(eid)["status"] == "awaiting_recovery"
+    assert robot.release_calls == 0
+    blocked = [e for e in store.get_events(eid)
+               if e["type"] == "recovery_followups_blocked"]
+    assert blocked and any("放下" in str(e["data"].get("blocked_actions")) for e in blocked)
+
+
+async def test_restart_after_decision_saved_resumes_same_phase(tmp_path):
+    """决定保存后、动作发出前重启：接续同一决定与阶段，不重复询问、不重跑动作。"""
+    db = tmp_path / "evidence6.db"
+    engine = Engine(Store(db), VirtualRobot())
+    eid = engine.start("flow1", RECOVER_MOVE_FLOW)
+    await wait_until(
+        lambda: any(nr["node_id"] == "m" and nr["status"] == "running"
+                    for nr in engine.store.get_execution(eid)["node_runs"]))
+    await _crash(engine)
+
+    engine = Engine(Store(db), VirtualRobot())
+    engine.decision_gate_delay = 0.8
+    engine.record_late_action(eid, "success", "设备确认完成")
+    assert engine.resolve_recovery(eid, finish=True)
+    await wait_until(lambda: engine.get(eid).task is not None)
+    await asyncio.sleep(0.1)
+    await _crash(engine)
+    saved_state = Store(db).get_recovery_state(eid)
+    assert saved_state["recovery_decision"] == "finish"
+    token = saved_state["recovery_token"]
+
+    engine = Engine(Store(db), VirtualRobot())
+    store = engine.store
+    await wait_until(lambda: store.get_execution(eid)["status"] == "succeeded", timeout=8)
+    final = store.get_execution(eid)
+    assert [nr["status"] for nr in final["node_runs"] if nr["node_id"] == "m"] == ["succeeded"]
+    assert store.get_recovery_state(eid) is None
+    assert token is not None

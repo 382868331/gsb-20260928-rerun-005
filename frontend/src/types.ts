@@ -56,7 +56,33 @@ export interface Execution {
     failure_detail?: string | null;
     last_progress?: Record<string, unknown> | null;
   } | null;
+  evidence?: EvidenceEntry[];
+  evidence_resolution?: Record<string, EvidenceResolution>;
+  blocked_followups?: string[] | null;
+  reawait_reason?: string | null;
   robot: { x: number; y: number; holding: string | null; idle: boolean; obstacle: boolean };
+}
+
+export interface EvidenceEntry {
+  id: number;
+  subject: 'position' | 'holding' | 'action_result';
+  source: string;
+  observed_at: string;
+  value: string;
+  detail: string | null;
+  status: 'active' | 'withdrawn' | 'superseded';
+  supersedes_id: number | null;
+  registered_at: string;
+  withdrawn_at: string | null;
+}
+
+export interface EvidenceResolution {
+  subject: string;
+  label: string;
+  status: 'confirmed' | 'disputed' | 'unknown';
+  value: unknown;
+  claims: unknown[];
+  evidence_ids: number[];
 }
 
 export interface ExecEvent {

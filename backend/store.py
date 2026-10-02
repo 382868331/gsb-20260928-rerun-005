@@ -69,6 +69,19 @@ class Store:
                     state TEXT NOT NULL,
                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
                 );
+                CREATE TABLE IF NOT EXISTS recovery_evidence(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    execution_id TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    detail TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    supersedes_id INTEGER,
+                    registered_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    withdrawn_at TEXT
+                );
                 """
             )
             # 旧库升级：补充终止原因列
@@ -339,3 +352,65 @@ class Store:
                 "DELETE FROM recovery_states WHERE execution_id=?",
                 (execution_id,),
             )
+
+    # ---- 核实证据逐项台账（位置 / 持物 / 动作结果分别登记）----
+
+    def add_recovery_evidence(
+        self, execution_id: str, subject: str, source: str,
+        observed_at: str, value: str, detail: str | None = None,
+        supersedes_id: int | None = None,
+    ) -> int:
+        """登记一条核实证据，返回台账序号。
+
+        证据只追加、不覆盖：修订是新增一条并把旧条目标记为 superseded；
+        撤回是把旧条目标记为 withdrawn。矛盾的条目由引擎层判定为待定，
+        后到达的一条绝不自动覆盖先登记的现场观察。
+        """
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO recovery_evidence(execution_id,subject,source,observed_at,"
+                "value,detail,supersedes_id) VALUES(?,?,?,?,?,?,?)",
+                (execution_id, subject, source, observed_at, value, detail,
+                 supersedes_id),
+            )
+            evidence_id = int(cur.lastrowid)
+            if supersedes_id is not None:
+                self._conn.execute(
+                    "UPDATE recovery_evidence SET status='superseded', "
+                    "withdrawn_at=datetime('now') WHERE execution_id=? AND id=?",
+                    (execution_id, supersedes_id),
+                )
+            return evidence_id
+
+    def withdraw_recovery_evidence(
+        self, execution_id: str, evidence_id: int,
+    ) -> bool:
+        """撤回一条仍有效的证据（如人工观察事后撤回）。
+
+        已撤回/已被修订的条目不能再次撤回。
+        """
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT id FROM recovery_evidence "
+                "WHERE execution_id=? AND id=? AND status='active'",
+                (execution_id, evidence_id),
+            ).fetchone()
+            if row is None:
+                return False
+            self._conn.execute(
+                "UPDATE recovery_evidence SET status='withdrawn', "
+                "withdrawn_at=datetime('now') WHERE execution_id=? AND id=?",
+                (execution_id, evidence_id),
+            )
+            return True
+
+    def get_recovery_evidence(self, execution_id: str) -> list[dict[str, Any]]:
+        """按登记顺序返回证据台账（含已撤回/已修订条目，保留修订历史）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id,subject,source,observed_at,value,detail,status,"
+                "supersedes_id,registered_at,withdrawn_at FROM recovery_evidence "
+                "WHERE execution_id=? ORDER BY id",
+                (execution_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]

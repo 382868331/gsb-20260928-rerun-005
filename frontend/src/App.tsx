@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import FlowCanvas from './FlowCanvas';
+import RecoveryPanel from './RecoveryPanel';
 import { api } from './api';
 import type { Execution, ExecEvent, Flow } from './types';
 
@@ -177,26 +178,29 @@ export default function App() {
             </div>
           )}
           {execution?.status === 'awaiting_recovery' && (
-            <div className="manual-bar recovery-bar">
-              <span className="manual-bar__title">
-                🛠 设备状态待核实：持有物「{execution.robot.holding ?? '空'}」，
-                最后位置 ({execution.robot.x}, {execution.robot.y})，
-                未确认动作：{recoveryNode?.label ?? recoveryNodeId ?? '无'}
-                {execution.unconfirmed_action?.attempt ? `（第${execution.unconfirmed_action.attempt}次）` : ''}
-                {execution.unconfirmed_action?.failure_detail ? `；原故障：${execution.unconfirmed_action.failure_detail}` : ''}
-              </span>
-              <button
-                className="btn-secondary"
-                onClick={() => runAction(() => api.recordLateAction(execution.id, 'success', '现场确认原动作已完成'))}
-              >登记迟到成功（不发新移动）</button>
-              <button
-                className="btn-primary"
-                onClick={() => runAction(() => api.resolveRecovery(execution.id, true))}
-              >继续收尾</button>
-              <button
-                className="btn-danger"
-                onClick={() => runAction(() => api.resolveRecovery(execution.id, false))}
-              >结束本次流程</button>
+            <div className="recovery-block">
+              <div className="manual-bar recovery-bar">
+                <span className="manual-bar__title">
+                  🛠 设备状态待核实：持有物「{execution.robot.holding ?? '空'}」，
+                  最后位置 ({execution.robot.x}, {execution.robot.y})，
+                  未确认动作：{recoveryNode?.label ?? recoveryNodeId ?? '无'}
+                  {execution.unconfirmed_action?.attempt ? `（第${execution.unconfirmed_action.attempt}次）` : ''}
+                  {execution.unconfirmed_action?.failure_detail ? `；原故障：${execution.unconfirmed_action.failure_detail}` : ''}
+                </span>
+                <button
+                  className="btn-secondary"
+                  onClick={() => runAction(() => api.recordLateAction(execution.id, 'success', '设备迟到回应：原动作已完成'))}
+                >登记迟到完成回应（仅入台账）</button>
+                <button
+                  className="btn-primary"
+                  onClick={() => runAction(() => api.resolveRecovery(execution.id, true))}
+                >继续（按台账依据）</button>
+                <button
+                  className="btn-danger"
+                  onClick={() => runAction(() => api.resolveRecovery(execution.id, false))}
+                >结束本次流程</button>
+              </div>
+              <RecoveryPanel execution={execution} onChanged={async () => { await refresh(execution.id); }} />
             </div>
           )}
           {flow && (

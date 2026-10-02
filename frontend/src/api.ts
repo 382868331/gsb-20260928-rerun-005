@@ -36,6 +36,21 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ outcome, detail }),
     }),
+  addEvidence: (
+    id: string,
+    payload: { subject: string; source: string; observed_at: string; value: string; detail?: string; supersedes_id?: number | null },
+  ) =>
+    req<{ evidence_id: number }>(`/api/executions/${id}/evidence`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }),
+  withdrawEvidence: (id: string, evidenceId: number, detail = '') =>
+    req(`/api/executions/${id}/evidence/withdraw`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ evidence_id: evidenceId, detail }),
+    }),
   setObstacle: (present: boolean) =>
     req('/api/robot/obstacle', {
       method: 'POST',

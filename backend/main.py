@@ -8,7 +8,9 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 
 from .engine import Engine
-from .schemas import FlowIn, LateActionIn, LateFinishIn, ManualResolveIn, ObstacleIn, RecoveryResolveIn
+from .schemas import (EvidenceIn, EvidenceWithdrawIn, FlowIn, LateActionIn,
+                      LateFinishIn, ManualResolveIn, ObstacleIn, RecoveryResolveIn)
+from .evidence import resolve_ledger
 from .simulator import VirtualRobot
 from .store import Store
 
@@ -142,6 +144,48 @@ async def record_late_action(execution_id: str, payload: LateActionIn):
     return {"status": payload.outcome}
 
 
+@app.get("/api/executions/{execution_id}/evidence")
+async def list_evidence(execution_id: str):
+    if app.state.store.get_execution(execution_id) is None:
+        raise HTTPException(404, "执行记录不存在")
+    ledger = app.state.store.get_recovery_evidence(execution_id)
+    return {"ledger": ledger, "resolution": resolve_ledger(ledger),
+            "state": app.state.store.get_recovery_state(execution_id)}
+
+
+@app.post("/api/executions/{execution_id}/evidence")
+async def add_evidence(execution_id: str, payload: EvidenceIn):
+    engine = app.state.engine
+    execution = engine.get(execution_id)
+    record = app.state.store.get_execution(execution_id)
+    if execution is None or record is None or record["status"] in (
+        "succeeded", "failed", "resolved", "cancelled"
+    ):
+        raise HTTPException(409, "当前无法登记核实证据")
+    if app.state.store.get_recovery_state(execution_id) is None:
+        raise HTTPException(409, "当前没有待核实的恢复")
+    evidence_id = engine.add_evidence(
+        execution_id, payload.subject, payload.source, payload.observed_at,
+        payload.value, payload.detail, payload.supersedes_id)
+    return {"evidence_id": evidence_id}
+
+
+@app.post("/api/executions/{execution_id}/evidence/withdraw")
+async def withdraw_evidence(execution_id: str, payload: EvidenceWithdrawIn):
+    engine = app.state.engine
+    execution = engine.get(execution_id)
+    record = app.state.store.get_execution(execution_id)
+    if execution is None or record is None or record["status"] in (
+        "succeeded", "failed", "resolved", "cancelled"
+    ):
+        raise HTTPException(409, "当前无法撤回核实证据")
+    if app.state.store.get_recovery_state(execution_id) is None:
+        raise HTTPException(409, "当前没有待核实的恢复")
+    if not engine.withdraw_evidence(execution_id, payload.evidence_id, payload.detail):
+        raise HTTPException(404, "该证据不存在或已失效")
+    return {"evidence_id": payload.evidence_id, "status": "withdrawn"}
+
+
 @app.get("/api/executions")
 async def list_executions():
     return app.state.store.list_executions()
@@ -169,6 +213,11 @@ async def get_execution(execution_id: str):
             "failure_detail": state.get("failure_detail"),
             "last_progress": state.get("last_progress"),
         }
+        ledger = app.state.store.get_recovery_evidence(execution_id)
+        record["evidence"] = ledger
+        record["evidence_resolution"] = resolve_ledger(ledger)
+        record["blocked_followups"] = state.get("blocked_subjects")
+        record["reawait_reason"] = state.get("reawait_reason")
     return record
 
 

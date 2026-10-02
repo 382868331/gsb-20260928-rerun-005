@@ -108,3 +108,74 @@
 .edge-failure { stroke-dasharray: 6 4; }
 .edge-exhausted { stroke-dasharray: 2 3; }
 .react-flow__edge.edge-failure path { stroke: #e5484d; }
+
+.recovery-block {
+  border: 1px solid #d7b65a;
+  border-radius: 10px;
+  background: #fffaf0;
+  padding: 8px 10px;
+  margin: 8px 0;
+}
+
+.evidence-panel { margin-top: 8px; font-size: 12px; }
+
+.evidence-reawait {
+  color: #9a3412;
+  background: #ffedd5;
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin-bottom: 6px;
+}
+
+.evidence-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.evidence-cell {
+  border-radius: 8px;
+  padding: 6px 8px;
+  border: 1px solid #ddd;
+  background: #fff;
+}
+
+.evidence-cell__title { font-weight: 600; margin-bottom: 2px; }
+.evidence-cell__value { font-size: 13px; }
+.evidence-cell__ids { color: #888; font-size: 11px; margin-top: 2px; }
+.evidence-confirmed { border-color: #4caf7d; background: #f0fbf5; }
+.evidence-disputed { border-color: #d97706; background: #fff7ed; }
+.evidence-unknown { border-color: #bbb; background: #fafafa; }
+
+.evidence-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 8px;
+  background: #fff;
+}
+
+.evidence-table th, .evidence-table td {
+  border: 1px solid #eee;
+  padding: 3px 6px;
+  text-align: left;
+}
+
+.evidence-row-inactive td { color: #aaa; text-decoration: line-through; }
+
+.evidence-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.evidence-form input, .evidence-form select {
+  padding: 4px 6px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+}
+
+.evidence-form input { flex: 1 1 200px; }
+
+.evidence-basis-hint { margin-top: 6px; color: #6b5200; }
