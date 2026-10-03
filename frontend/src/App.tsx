@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import FlowCanvas from './FlowCanvas';
 import { api } from './api';
 import type { Execution, ExecEvent, Flow } from './types';
+import type { EvidenceItem } from './types';
 
 const STATUS_TEXT: Record<string, string> = {
   running: '运行中',
@@ -26,6 +27,13 @@ export default function App() {
   const [events, setEvents] = useState<ExecEvent[]>([]);
   const [obstacle, setObstacle] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [evCategory, setEvCategory] = useState<EvidenceItem['category']>('position');
+  const [evSource, setEvSource] = useState<EvidenceItem['source']>('onsite');
+  const [evPosX, setEvPosX] = useState('0');
+  const [evPosY, setEvPosY] = useState('0');
+  const [evHolding, setEvHolding] = useState('');
+  const [evOutcome, setEvOutcome] = useState<'success' | 'failure'>('success');
+  const [evDetail, setEvDetail] = useState('');
   const seqRef = useRef(0);
   const executionIdRef = useRef<string | null>(null);
 
@@ -118,6 +126,39 @@ export default function App() {
     ? flow?.definition.nodes.find((n) => n.id === recoveryNodeId) ?? null
     : null;
 
+  const evidence = execution?.evidence ?? [];
+  const decisions = execution?.recovery_decisions ?? [];
+  const conflicts = execution?.evidence_conflicts ?? {};
+  const hasConflict = Object.keys(conflicts).length > 0;
+
+  const CATEGORY_TEXT: Record<EvidenceItem['category'], string> = {
+    position: '位置',
+    holding: '持物',
+    action_result: '动作结果',
+  };
+
+  function evidenceValueText(item: EvidenceItem): string {
+    if (item.category === 'position') return `(${String(item.value.x)}, ${String(item.value.y)})`;
+    if (item.category === 'holding') return String(item.value.holding ?? '空');
+    return `${String(item.value.outcome ?? '')}${item.value.detail ? `：${String(item.value.detail)}` : ''}`;
+  }
+
+  async function submitEvidence() {
+    if (!execution) return;
+    let value: Record<string, unknown>;
+    if (evCategory === 'position') value = { x: Number(evPosX), y: Number(evPosY) };
+    else if (evCategory === 'holding') value = { holding: evHolding || null };
+    else value = { outcome: evOutcome, detail: evDetail || '人工观察' };
+    await runAction(() => api.recordEvidence(execution.id, evCategory, evSource, value));
+  }
+
+  async function retractEvidence(item: EvidenceItem) {
+    if (!execution) return;
+    const reason = window.prompt('撤回原因（必填）', '观察有误');
+    if (!reason) return;
+    await runAction(() => api.retractEvidence(execution.id, item.id, reason));
+  }
+
   return (
     <div className="app">
       <header className="topbar">
@@ -197,6 +238,76 @@ export default function App() {
                 className="btn-danger"
                 onClick={() => runAction(() => api.resolveRecovery(execution.id, false))}
               >结束本次流程</button>
+            </div>
+          )}
+          {execution?.status === 'awaiting_recovery' && (
+            <div className="evidence-panel">
+              <h3>核实证据（位置 / 持物 / 动作结果）</h3>
+              {hasConflict && (
+                <div className="conflict-warning">
+                  ⚠ 有效证据互相矛盾（{Object.keys(conflicts).map((c) => CATEGORY_TEXT[c as EvidenceItem['category']] ?? c).join('、')}），
+                  已阻止继续执行；请撤回错误观察后再决定。
+                </div>
+              )}
+              <div className="evidence-form">
+                <select value={evCategory} onChange={(e) => setEvCategory(e.target.value as EvidenceItem['category'])}>
+                  <option value="position">位置</option>
+                  <option value="holding">持物</option>
+                  <option value="action_result">动作结果</option>
+                </select>
+                <select value={evSource} onChange={(e) => setEvSource(e.target.value as EvidenceItem['source'])}>
+                  <option value="onsite">现场观察</option>
+                  <option value="device">设备迟到回应</option>
+                </select>
+                {evCategory === 'position' && (
+                  <span>
+                    x:<input className="evidence-num" value={evPosX} onChange={(e) => setEvPosX(e.target.value)} />
+                    y:<input className="evidence-num" value={evPosY} onChange={(e) => setEvPosY(e.target.value)} />
+                  </span>
+                )}
+                {evCategory === 'holding' && (
+                  <input placeholder="持有物（留空表示空爪）" value={evHolding} onChange={(e) => setEvHolding(e.target.value)} />
+                )}
+                {evCategory === 'action_result' && (
+                  <span>
+                    <select value={evOutcome} onChange={(e) => setEvOutcome(e.target.value as 'success' | 'failure')}>
+                      <option value="success">成功</option>
+                      <option value="failure">失败</option>
+                    </select>
+                    <input placeholder="说明" value={evDetail} onChange={(e) => setEvDetail(e.target.value)} />
+                  </span>
+                )}
+                <button className="btn-secondary" onClick={() => void submitEvidence()}>登记证据</button>
+              </div>
+              <ul className="evidence-list">
+                {evidence.length === 0 && <li className="muted">暂无证据</li>}
+                {evidence.map((item) => (
+                  <li key={item.id} className={item.retracted ? 'evidence-item retracted' : 'evidence-item'}>
+                    <span>
+                      #{item.id} {CATEGORY_TEXT[item.category]}＝{evidenceValueText(item)}
+                      （{item.source === 'onsite' ? '现场观察' : '设备迟到回应'}，观察时刻 {item.observed_at}）
+                    </span>
+                    {item.retracted ? (
+                      <span className="retract-info">已撤回：{item.retract_reason}</span>
+                    ) : (
+                      <button className="btn-link" onClick={() => void retractEvidence(item)}>撤回</button>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {decisions.length > 0 && (
+            <div className="decision-panel">
+              <h3>恢复处置决定与依据</h3>
+              <ul>
+                {decisions.map((d) => (
+                  <li key={d.id}>
+                    [{d.created_at}] {d.decision === 'finish' ? '继续' : '结束'}
+                    {d.node_id ? `（节点 ${d.node_id} 第${String(d.attempt ?? 1)}次）` : ''}：{d.summary}
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
           {flow && (

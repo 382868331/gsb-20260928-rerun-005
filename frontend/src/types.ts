@@ -49,6 +49,9 @@ export interface Execution {
   current_node?: string | null;
   current_attempt?: number;
   recovery?: Record<string, unknown> | null;
+  evidence?: EvidenceItem[];
+  evidence_conflicts?: Record<string, number[]>;
+  recovery_decisions?: RecoveryDecision[];
   unconfirmed_action?: {
     node_id?: string | null;
     attempt?: number | null;
@@ -57,6 +60,28 @@ export interface Execution {
     last_progress?: Record<string, unknown> | null;
   } | null;
   robot: { x: number; y: number; holding: string | null; idle: boolean; obstacle: boolean };
+}
+
+export interface EvidenceItem {
+  id: number;
+  node_id: string | null;
+  attempt: number | null;
+  category: 'position' | 'holding' | 'action_result';
+  source: 'onsite' | 'device';
+  value: Record<string, unknown>;
+  observed_at: string;
+  retracted: boolean;
+  retract_reason: string | null;
+}
+
+export interface RecoveryDecision {
+  id: number;
+  node_id: string | null;
+  attempt: number | null;
+  decision: string;
+  evidence_ids: number[];
+  summary: string;
+  created_at: string;
 }
 
 export interface ExecEvent {

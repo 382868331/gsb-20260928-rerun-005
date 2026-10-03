@@ -1,4 +1,4 @@
-import type { Execution, ExecEvent, Flow } from './types';
+import type { EvidenceItem, Execution, ExecEvent, Flow, RecoveryDecision } from './types';
 
 async function req<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
@@ -36,6 +36,20 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ outcome, detail }),
     }),
+  recordEvidence: (id: string, category: EvidenceItem['category'], source: EvidenceItem['source'], value: Record<string, unknown>) =>
+    req<{ evidence_id: number }>(`/api/executions/\${id}/evidence`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ category, source, value, observed_at: new Date().toISOString() }),
+    }),
+  retractEvidence: (id: string, evidenceId: number, reason: string) =>
+    req(`/api/executions/\${id}/evidence/\${evidenceId}/retract`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason }),
+    }),
+  recoveryHistory: (id: string) =>
+    req<{ evidence: EvidenceItem[]; decisions: RecoveryDecision[] }>(`/api/executions/\${id}/recovery/history`),
   setObstacle: (present: boolean) =>
     req('/api/robot/obstacle', {
       method: 'POST',

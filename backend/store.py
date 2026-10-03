@@ -69,6 +69,29 @@ class Store:
                     state TEXT NOT NULL,
                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
                 );
+                CREATE TABLE IF NOT EXISTS evidence(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    execution_id TEXT NOT NULL,
+                    node_id TEXT,
+                    attempt INTEGER,
+                    category TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    retracted INTEGER NOT NULL DEFAULT 0,
+                    retract_reason TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                CREATE TABLE IF NOT EXISTS recovery_decisions(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    execution_id TEXT NOT NULL,
+                    node_id TEXT,
+                    attempt INTEGER,
+                    decision TEXT NOT NULL,
+                    evidence_ids TEXT,
+                    summary TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
                 """
             )
             # 旧库升级：补充终止原因列
@@ -339,3 +362,67 @@ class Store:
                 "DELETE FROM recovery_states WHERE execution_id=?",
                 (execution_id,),
             )
+
+    def add_evidence(
+        self, execution_id: str, node_id: str | None, attempt: int | None,
+        category: str, source: str, value: dict[str, Any],
+        observed_at: str | None = None,
+    ) -> int:
+        """登记一条核实证据（位置/持物/动作结果），只插入不覆盖。"""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO evidence(execution_id,node_id,attempt,category,source,value,observed_at) "
+                "VALUES(?,?,?,?,?,?,COALESCE(?, datetime('now')))",
+                (execution_id, node_id, attempt, category, source,
+                 json.dumps(value, ensure_ascii=False), observed_at),
+            )
+        return int(cur.lastrowid)
+
+    def list_evidence(self, execution_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM evidence WHERE execution_id=? ORDER BY id",
+                (execution_id,),
+            ).fetchall()
+        result = []
+        for r in rows:
+            item = dict(r)
+            item["value"] = json.loads(item["value"])
+            item["retracted"] = bool(item["retracted"])
+            result.append(item)
+        return result
+
+    def retract_evidence(self, evidence_id: int, reason: str) -> bool:
+        """撤回一条错误观察：保留原记录，仅标记失效并记录原因。"""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE evidence SET retracted=1, retract_reason=? "
+                "WHERE id=? AND retracted=0",
+                (reason, evidence_id),
+            )
+        return cur.rowcount > 0
+
+    def add_recovery_decision(
+        self, execution_id: str, node_id: str | None, attempt: int | None,
+        decision: str, evidence_ids: list[int], summary: str,
+    ) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO recovery_decisions(execution_id,node_id,attempt,decision,evidence_ids,summary) "
+                "VALUES(?,?,?,?,?,?)",
+                (execution_id, node_id, attempt, decision,
+                 json.dumps(evidence_ids), summary),
+            )
+
+    def list_recovery_decisions(self, execution_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM recovery_decisions WHERE execution_id=? ORDER BY id",
+                (execution_id,),
+            ).fetchall()
+        result = []
+        for r in rows:
+            item = dict(r)
+            item["evidence_ids"] = json.loads(item["evidence_ids"] or "[]")
+            result.append(item)
+        return result

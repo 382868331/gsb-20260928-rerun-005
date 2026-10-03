@@ -8,7 +8,10 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 
 from .engine import Engine
-from .schemas import FlowIn, LateActionIn, LateFinishIn, ManualResolveIn, ObstacleIn, RecoveryResolveIn
+from .schemas import (
+    EvidenceIn, FlowIn, LateActionIn, LateFinishIn, ManualResolveIn,
+    ObstacleIn, RecoveryResolveIn, RetractIn,
+)
 from .simulator import VirtualRobot
 from .store import Store
 
@@ -142,6 +145,33 @@ async def record_late_action(execution_id: str, payload: LateActionIn):
     return {"status": payload.outcome}
 
 
+@app.post("/api/executions/{execution_id}/evidence")
+async def record_evidence(execution_id: str, payload: EvidenceIn):
+    evidence_id = app.state.engine.record_evidence(
+        execution_id, payload.category, payload.source, payload.value,
+        payload.observed_at)
+    if evidence_id is None:
+        raise HTTPException(409, "当前无法登记证据（执行不在待核实状态）")
+    return {"evidence_id": evidence_id}
+
+
+@app.post("/api/executions/{execution_id}/evidence/{evidence_id}/retract")
+async def retract_evidence(execution_id: str, evidence_id: int, payload: RetractIn):
+    if not app.state.engine.retract_evidence(execution_id, evidence_id, payload.reason):
+        raise HTTPException(409, "证据不存在或已撤回")
+    return {"status": "retracted"}
+
+
+@app.get("/api/executions/{execution_id}/recovery/history")
+async def recovery_history(execution_id: str):
+    if app.state.store.get_execution(execution_id) is None:
+        raise HTTPException(404, "执行记录不存在")
+    return {
+        "evidence": app.state.store.list_evidence(execution_id),
+        "decisions": app.state.store.list_recovery_decisions(execution_id),
+    }
+
+
 @app.get("/api/executions")
 async def list_executions():
     return app.state.store.list_executions()
@@ -160,6 +190,12 @@ async def get_execution(execution_id: str):
     record["current_node"] = execution.current_node if execution else state.get("current_node")
     record["current_attempt"] = execution.current_attempt if execution else state.get("current_attempt", 0)
     record["recovery"] = state
+    record["evidence"] = app.state.store.list_evidence(execution_id)
+    record["recovery_decisions"] = app.state.store.list_recovery_decisions(execution_id)
+    node_id = record["current_node"]
+    attempt = record["current_attempt"] or None
+    record["evidence_conflicts"] = app.state.engine.evidence_conflicts(
+        execution_id, node_id, attempt) if node_id else {}
     if record["status"] == "awaiting_recovery":
         record["robot"] = state.get("last_robot", record["robot"])
         record["unconfirmed_action"] = {

@@ -108,3 +108,67 @@
 .edge-failure { stroke-dasharray: 6 4; }
 .edge-exhausted { stroke-dasharray: 2 3; }
 .react-flow__edge.edge-failure path { stroke: #e5484d; }
+
+.evidence-panel, .decision-panel {
+  background: #1c2230;
+  border: 1px solid #2c3648;
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin: 8px 0;
+  font-size: 13px;
+}
+
+.evidence-panel h3, .decision-panel h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+}
+
+.conflict-warning {
+  background: #4a2c2c;
+  border: 1px solid #a45555;
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  color: #ffb4b4;
+}
+
+.evidence-form {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.evidence-form input, .evidence-form select {
+  background: #12161f;
+  border: 1px solid #2c3648;
+  border-radius: 4px;
+  color: inherit;
+  padding: 4px 6px;
+}
+
+.evidence-num { width: 56px; margin: 0 4px; }
+
+.evidence-list { list-style: none; margin: 0; padding: 0; }
+
+.evidence-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 0;
+}
+
+.evidence-item.retracted { opacity: 0.55; text-decoration: line-through; }
+
+.retract-info { color: #d9a441; text-decoration: none; }
+
+.btn-link {
+  background: none;
+  border: none;
+  color: #6ea8fe;
+  cursor: pointer;
+  padding: 0;
+}
+
+.decision-panel ul { margin: 0; padding-left: 18px; }
