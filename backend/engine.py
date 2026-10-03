@@ -36,6 +36,7 @@ class Execution:
     in_retry_loop: bool = False  # 是否已进入过失败回路
     recovery_state: dict | None = None
     active_definition: dict | None = None
+    stale_pending: bool = False
 
     def next_node(self, node_id: str, kind: str) -> str | None:
         definition = self.active_definition or self.definition
@@ -64,7 +65,8 @@ class Engine:
                             and state.get("manual_decision") is not None
                             else state.get("recovery_decision"))
                 if decision is not None:
-                    execution.task = asyncio.create_task(self._recover(execution, decision))
+                    execution.task = asyncio.create_task(
+                        self._recover(execution, decision, auto=True))
 
     async def subscribe(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=256)
@@ -211,8 +213,66 @@ class Engine:
         state = execution.recovery_state or {}
         if state.get("recovery_decision") is not None:
             return False
-        self._save_checkpoint(execution, recovery_decision=decision)
+        # 有效证据互相矛盾时不允许继续/结束：保留全部记录，等待人工撤回或补充。
+        if self.store.evidence_conflicts(execution_id):
+            self._emit(execution_id, "recovery_blocked_by_conflict",
+                       message="证据互相矛盾，恢复处置被阻止；请撤回错误观察后再决定")
+            return False
+        relied = [e["id"] for e in self.store.get_evidence(execution_id)
+                  if not e["retracted"]]
+        self._save_checkpoint(execution, recovery_decision=decision,
+                              recovery_evidence=relied)
+        self._emit(execution_id, "recovery_decision_saved",
+                   message=f"恢复处置已保存：{decision}（依据证据："
+                           f"{', '.join('#' + str(i) for i in relied) or '无'}）",
+                   data={"decision": decision, "evidence_ids": relied})
         execution.task = asyncio.create_task(self._recover(execution, decision))
+        return True
+
+    def record_evidence(self, execution_id: str, category: str, source: str,
+                        value: str, detail: str | None = None) -> int | None:
+        """登记一条核实证据（位置/持物/动作结果），保留来源与观察时刻。"""
+        execution = self._executions.get(execution_id)
+        record = self.store.get_execution(execution_id)
+        if not execution or not record or record["status"] != RECOVERY_STATUS:
+            return None
+        if (execution.recovery_state or {}).get("recovery_decision") is not None:
+            return None
+        state = execution.recovery_state or {}
+        evidence_id = self.store.add_evidence(
+            execution_id, category, source, value, detail,
+            node_id=state.get("current_node"),
+            attempt=state.get("current_attempt"))
+        category_label = {"position": "位置", "holding": "持物",
+                          "action_result": "动作结果"}[category]
+        source_label = {"onsite": "现场观察", "device_late": "设备迟到回应"}[source]
+        self._emit(execution_id, "evidence_recorded",
+                   (execution.recovery_state or {}).get("current_node"),
+                   f"登记{category_label}证据（{source_label}）：{value}",
+                   data={"evidence_id": evidence_id, "category": category,
+                         "source": source, "value": value, "detail": detail})
+        conflicts = self.store.evidence_conflicts(execution_id)
+        if conflicts:
+            self._emit(execution_id, "evidence_conflict", None,
+                       "证据互相矛盾（"
+                       + "、".join(sorted(conflicts))
+                       + "），旧记录保留，恢复处置被阻止",
+                       data={"categories": sorted(conflicts)})
+        return evidence_id
+
+    def retract_evidence(self, execution_id: str, evidence_id: int, reason: str) -> bool:
+        """操作员撤回一条错误证据并说明原因；记录保留，状态置为已撤回。"""
+        execution = self._executions.get(execution_id)
+        record = self.store.get_execution(execution_id)
+        if not execution or not record or record["status"] != RECOVERY_STATUS:
+            return False
+        if (execution.recovery_state or {}).get("recovery_decision") is not None:
+            return False
+        if not self.store.retract_evidence(execution_id, evidence_id, reason):
+            return False
+        self._emit(execution_id, "evidence_retracted", None,
+                   f"证据 #{evidence_id} 已撤回：{reason}",
+                   data={"evidence_id": evidence_id, "reason": reason})
         return True
 
     async def _gate(self, execution: Execution) -> None:
@@ -233,6 +293,10 @@ class Engine:
             return False
         self.store.add_node_followup(
             execution_id, node_id, attempt, "late_result", outcome, detail)
+        # 设备迟到回应同时作为“动作结果”证据登记，带来源与观察时刻
+        self.store.add_evidence(
+            execution_id, "action_result", "device_late", outcome, detail,
+            node_id=node_id, attempt=attempt)
         self._emit(execution_id, "late_result_recorded", node_id,
                    f"重启核实期间收到的迟到结果（{outcome}）仅补充到旧执行：{detail}",
                    data={"attempt": attempt, "outcome": outcome, "detail": detail,
@@ -241,11 +305,13 @@ class Engine:
                               late_action_detail=detail)
         return True
 
-    async def _recover(self, execution: Execution, decision: str) -> None:
+    async def _recover(self, execution: Execution, decision: str,
+                       auto: bool = False) -> None:
         eid = execution.id
         state = execution.recovery_state or {}
-        self._emit(eid, "recovery_decision_saved",
-                   message=f"恢复处置已保存：{decision}", data={"decision": decision})
+        if decision.startswith("manual_"):
+            self._emit(eid, "recovery_decision_saved",
+                       message=f"恢复处置已保存：{decision}", data={"decision": decision})
         last_robot = state.get("last_robot") or self.robot.status()
         self.robot.state.x = float(last_robot.get("x", 0))
         self.robot.state.y = float(last_robot.get("y", 0))
@@ -330,14 +396,50 @@ class Engine:
         node_id = state.get("current_node")
         attempt = int(state.get("current_attempt", 1))
         late = state.get("late_action_outcome")
+        if late is None:
+            outcomes = {e["value"] for e in self.store.get_evidence(eid)
+                        if not e["retracted"] and e["category"] == "action_result"
+                        and e.get("node_id") in (None, node_id)
+                        and (e.get("attempt") in (None, attempt))}
+            if len(outcomes) == 1:
+                late = outcomes.pop()
         if late == "success":
             self._set_status(eid, "running")
             self.store.finish_node_run_guarded(
                 eid, node_id, attempt, "succeeded",
                 state.get("late_action_detail", "重启后由设备迟到回应确认完成"))
+            # 迟到结论只对应当前节点，消费后立即清除，不得套用到后续节点
+            state["late_action_outcome"] = None
+            state["late_action_detail"] = None
+            execution.recovery_state = state
+            self._save_checkpoint(execution, phase="node_succeeded",
+                                  last_completed_node=node_id)
             resume_definition = self._tail_definition(execution, node_id, "success")
             await self._run(execution, resume_definition=resume_definition,
                             emit_started=False)
+            return
+
+        if late == "failure":
+            # 有效证据确认原动作失败：不当作成功继续，按失败收尾后结束
+            self._set_status(eid, "running")
+            if node_id:
+                failed_node = next(n for n in execution.definition["nodes"]
+                                   if n["id"] == node_id)
+                self.store.finish_node_run_guarded(
+                    eid, node_id, attempt, "failed",
+                    state.get("late_action_detail") or "证据确认原动作失败")
+                self.store.add_node_followup(
+                    eid, node_id, attempt, "recovery", "failed",
+                    "证据确认原动作失败，按失败收尾，不重复执行该动作")
+                await self._run_failure_cleanup(
+                    execution, failed_node, attempt,
+                    state.get("late_action_detail") or "证据确认原动作失败",
+                    resuming=True)
+            fail_reason = reason + "；证据确认原动作失败"
+            self.store.set_execution_status(eid, "resolved", fail_reason)
+            self._emit(eid, "execution_finished", message="人工核实后结束流程",
+                       data={"status": "resolved", "reason": fail_reason})
+            self.store.delete_recovery_state(eid)
             return
 
         if execution.stop.is_set():
@@ -359,6 +461,19 @@ class Engine:
             return
 
         if node_id:
+            if auto and self.store.node_run_status(eid, node_id, attempt) in (
+                    "running", "waiting"):
+                # 自动恢复时发现决定作出后又有动作结果未知：
+                # 必要状态缺失，保持待核实，不重复发出同一动作。
+                state["recovery_decision"] = None
+                state["recovery_evidence"] = None
+                execution.recovery_state = state
+                self._save_checkpoint(execution, phase="action")
+                self._set_status(eid, RECOVERY_STATUS)
+                self._emit(eid, "recovery_required", node_id,
+                           f"第 {attempt} 次动作结果未知，保持待核实，不重复发出同一动作",
+                           data={"attempt": attempt})
+                return
             failed_node = next(n for n in execution.definition["nodes"]
                                if n["id"] == node_id)
             self.store.add_node_followup(
@@ -430,6 +545,50 @@ class Engine:
                     continue
 
                 attempt = execution.attempts.get(current, 0) + 1
+                existing = self.store.node_run_status(eid, current, attempt)
+                if existing is not None:
+                    # 幂等保护：恢复/重启后同一 (节点, 轮次) 绝不重复发出动作。
+                    if existing == "succeeded":
+                        self._emit(eid, "node_skipped_already_done", current,
+                                   f"第 {attempt} 次已确认完成，跳过不重复执行",
+                                   data={"attempt": attempt, "status": existing})
+                        current = execution.next_node(current, "success")
+                        continue
+                    if existing == "failed":
+                        max_retries = int(node.get("params", {}).get("max_retries", 3))
+                        kind = "failure" if attempt <= max_retries else "exhausted"
+                        target = (execution.next_node(current, kind)
+                                  or execution.next_node(current, "failure"))
+                        self._emit(eid, "node_skipped_already_done", current,
+                                   f"第 {attempt} 次已定格失败，按原分支继续，不重复执行",
+                                   data={"attempt": attempt, "status": existing})
+                        if target is None:
+                            final_status = "failed"
+                            break
+                        execution.in_retry_loop = True
+                        current = target
+                        continue
+                    if existing in ("cancelled", "aborted"):
+                        final_status = "cancelled"
+                        break
+                    # running/waiting：进程在动作途中消失，结果未知。
+                    # 不重复发出同一动作，回到待核实，由人工登记证据后决定。
+                    execution.attempts[current] = attempt
+                    execution.current_node = current
+                    execution.current_attempt = attempt
+                    # 旧决定所依据的状态已缺失，清除决定，等待重新核实
+                    state = execution.recovery_state or {}
+                    state["recovery_decision"] = None
+                    state["recovery_evidence"] = None
+                    state["late_action_outcome"] = None
+                    execution.recovery_state = state
+                    self._save_checkpoint(execution, phase="action")
+                    self._set_status(eid, RECOVERY_STATUS)
+                    self._emit(eid, "recovery_required", current,
+                               f"第 {attempt} 次动作结果未知，保持待核实，不重复发出同一动作",
+                               data={"attempt": attempt})
+                    execution.stale_pending = True
+                    return
                 execution.attempts[current] = attempt
                 execution.current_node = current
                 execution.current_attempt = attempt
@@ -528,6 +687,9 @@ class Engine:
                     current = target
                     continue
                 self.store.finish_node_run(eid, current, attempt, "succeeded", detail)
+                if execution.recovery_state is not None:
+                    execution.recovery_state["late_action_outcome"] = None
+                    execution.recovery_state["late_action_detail"] = None
                 self._save_checkpoint(execution, phase="node_succeeded",
                                       last_completed_node=current,
                                       completed_cleanup_stages=[])
@@ -559,6 +721,9 @@ class Engine:
                        data={"status": "failed", "reason": reason})
         finally:
             self._executions.pop(eid, None)
+            if getattr(execution, "stale_pending", False):
+                # 动作结果未知：保留在执行表中，等待人工核实证据后决定
+                self._executions[eid] = execution
 
     def _termination_reason(self, execution: Execution, status: str) -> str | None:
         eid = execution.id

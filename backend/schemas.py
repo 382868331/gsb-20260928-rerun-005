@@ -58,3 +58,14 @@ class RecoveryResolveIn(BaseModel):
 class LateActionIn(BaseModel):
     outcome: Literal["success", "failure"] = "success"
     detail: str = "设备迟到回应"
+
+
+class EvidenceIn(BaseModel):
+    category: Literal["position", "holding", "action_result"]
+    source: Literal["onsite", "device_late"] = "onsite"
+    value: str
+    detail: str | None = None
+
+
+class RetractIn(BaseModel):
+    reason: str

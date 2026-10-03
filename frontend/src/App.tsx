@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import FlowCanvas from './FlowCanvas';
 import { api } from './api';
 import type { Execution, ExecEvent, Flow } from './types';
+import EvidencePanel from './EvidencePanel';
+import HistoryPanel from './HistoryPanel';
 
 const STATUS_TEXT: Record<string, string> = {
   running: '运行中',
@@ -179,6 +181,7 @@ export default function App() {
           {execution?.status === 'awaiting_recovery' && (
             <div className="manual-bar recovery-bar">
               <span className="manual-bar__title">
+                {Object.keys(execution.evidence_conflicts ?? {}).length > 0 && '⚠ 证据矛盾，已阻止推进；'}
                 🛠 设备状态待核实：持有物「{execution.robot.holding ?? '空'}」，
                 最后位置 ({execution.robot.x}, {execution.robot.y})，
                 未确认动作：{recoveryNode?.label ?? recoveryNodeId ?? '无'}
@@ -192,10 +195,12 @@ export default function App() {
               <button
                 className="btn-primary"
                 onClick={() => runAction(() => api.resolveRecovery(execution.id, true))}
+                disabled={Object.keys(execution.evidence_conflicts ?? {}).length > 0}
               >继续收尾</button>
               <button
                 className="btn-danger"
                 onClick={() => runAction(() => api.resolveRecovery(execution.id, false))}
+                disabled={Object.keys(execution.evidence_conflicts ?? {}).length > 0}
               >结束本次流程</button>
             </div>
           )}
@@ -218,6 +223,10 @@ export default function App() {
               <dt>障碍物</dt><dd>{obstacle ? '存在 🚧' : '无'}</dd>
             </dl>
           </div>
+          {execution && (execution.status === 'awaiting_recovery' || (execution.evidence ?? []).length > 0) && (
+            <EvidencePanel execution={execution} runAction={runAction} />
+          )}
+          <HistoryPanel />
           <div className="panel panel-log">
             <h2>执行记录（服务端持久化）</h2>
             <ul>

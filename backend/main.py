@@ -8,7 +8,10 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 
 from .engine import Engine
-from .schemas import FlowIn, LateActionIn, LateFinishIn, ManualResolveIn, ObstacleIn, RecoveryResolveIn
+from .schemas import (
+    EvidenceIn, FlowIn, LateActionIn, LateFinishIn, ManualResolveIn, ObstacleIn,
+    RecoveryResolveIn, RetractIn,
+)
 from .simulator import VirtualRobot
 from .store import Store
 
@@ -128,9 +131,30 @@ async def resolve_manual(execution_id: str, payload: ManualResolveIn):
 
 @app.post("/api/executions/{execution_id}/recovery")
 async def resolve_recovery(execution_id: str, payload: RecoveryResolveIn):
+    conflicts = app.state.store.evidence_conflicts(execution_id)
+    if conflicts:
+        raise HTTPException(
+            409, "证据互相矛盾，恢复处置被阻止："
+            + "、".join(sorted(conflicts)))
     if not app.state.engine.resolve_recovery(execution_id, finish=payload.finish):
         raise HTTPException(409, "当前没有待核实的恢复处置")
     return {"status": "finishing" if payload.finish else "resolved"}
+
+
+@app.post("/api/executions/{execution_id}/evidence")
+async def record_evidence(execution_id: str, payload: EvidenceIn):
+    evidence_id = app.state.engine.record_evidence(
+        execution_id, payload.category, payload.source, payload.value, payload.detail)
+    if evidence_id is None:
+        raise HTTPException(409, "当前无法登记证据（执行不在待核实状态或已有决定）")
+    return {"evidence_id": evidence_id}
+
+
+@app.post("/api/executions/{execution_id}/evidence/{evidence_id}/retract")
+async def retract_evidence(execution_id: str, evidence_id: int, payload: RetractIn):
+    if not app.state.engine.retract_evidence(execution_id, evidence_id, payload.reason):
+        raise HTTPException(409, "当前无法撤回该证据")
+    return {"status": "retracted"}
 
 
 @app.post("/api/executions/{execution_id}/late-action")

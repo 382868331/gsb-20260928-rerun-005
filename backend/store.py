@@ -69,8 +69,30 @@ class Store:
                     state TEXT NOT NULL,
                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
                 );
+                CREATE TABLE IF NOT EXISTS evidence(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    execution_id TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    detail TEXT,
+                    node_id TEXT,
+                    attempt INTEGER,
+                    observed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    retracted INTEGER NOT NULL DEFAULT 0,
+                    retract_reason TEXT,
+                    retracted_at TEXT
+                );
                 """
             )
+            # 旧库升级：补充证据归属列
+            cols = {r[1] for r in self._conn.execute(
+                "PRAGMA table_info(evidence)")}
+            for col in ("node_id", "attempt"):
+                if col not in cols:
+                    self._conn.execute(
+                        f"ALTER TABLE evidence ADD COLUMN {col} "
+                        + ("TEXT" if col == "node_id" else "INTEGER"))
             # 旧库升级：补充终止原因列
             cols = {r[1] for r in self._conn.execute(
                 "PRAGMA table_info(executions)")}
@@ -289,6 +311,8 @@ class Store:
             "started_at": er["started_at"], "updated_at": er["updated_at"],
             "node_runs": [dict(r) for r in nr],
             "followups": self.get_node_followups(execution_id),
+            "evidence": self.get_evidence(execution_id),
+            "evidence_conflicts": self.evidence_conflicts(execution_id),
         }
 
     def list_executions(self) -> list[dict[str, Any]]:
@@ -339,3 +363,66 @@ class Store:
                 "DELETE FROM recovery_states WHERE execution_id=?",
                 (execution_id,),
             )
+
+    EVIDENCE_CATEGORIES = {"position", "holding", "action_result"}
+    EVIDENCE_SOURCES = {"onsite", "device_late"}
+
+    def add_evidence(
+        self, execution_id: str, category: str, source: str, value: str,
+        detail: str | None = None, observed_at: str | None = None,
+        node_id: str | None = None, attempt: int | None = None,
+    ) -> int:
+        """登记一条核实证据。证据只增不改，矛盾时并保留，由撤回机制处理。"""
+        if category not in self.EVIDENCE_CATEGORIES:
+            raise ValueError(f"未知证据类别：{category}")
+        if source not in self.EVIDENCE_SOURCES:
+            raise ValueError(f"未知证据来源：{source}")
+        with self._lock, self._conn:
+            if observed_at is None:
+                cur = self._conn.execute(
+                    "INSERT INTO evidence(execution_id,category,source,value,detail,"
+                    "node_id,attempt) VALUES(?,?,?,?,?,?,?)",
+                    (execution_id, category, source, value, detail, node_id, attempt),
+                )
+            else:
+                cur = self._conn.execute(
+                    "INSERT INTO evidence(execution_id,category,source,value,detail,"
+                    "node_id,attempt,observed_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (execution_id, category, source, value, detail, node_id, attempt,
+                     observed_at),
+                )
+            return int(cur.lastrowid)
+
+    def retract_evidence(self, execution_id: str, evidence_id: int, reason: str) -> bool:
+        """撤回一条错误证据（保留记录与撤回原因，不物理删除）。"""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE evidence SET retracted=1, retract_reason=?, "
+                "retracted_at=datetime('now') "
+                "WHERE id=? AND execution_id=? AND retracted=0",
+                (reason, evidence_id, execution_id),
+            )
+            return cur.rowcount > 0
+
+    def get_evidence(self, execution_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id,category,source,value,detail,observed_at,retracted,"
+                "retract_reason,retracted_at,node_id,attempt FROM evidence "
+                "WHERE execution_id=? ORDER BY id",
+                (execution_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def evidence_conflicts(self, execution_id: str) -> dict[str, list[dict[str, Any]]]:
+        """按类别检查有效证据是否互相矛盾。矛盾只报告，不覆盖任何记录。"""
+        conflicts: dict[str, list[dict[str, Any]]] = {}
+        valid = [e for e in self.get_evidence(execution_id) if not e["retracted"]]
+        by_category: dict[str, list[dict[str, Any]]] = {}
+        for item in valid:
+            by_category.setdefault(item["category"], []).append(item)
+        for category, items in by_category.items():
+            values = {item["value"] for item in items}
+            if len(values) > 1:
+                conflicts[category] = items
+        return conflicts

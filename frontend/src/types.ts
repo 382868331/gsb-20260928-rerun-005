@@ -30,6 +30,20 @@ export interface NodeRun {
   started_at?: string;
   finished_at?: string | null;
 }
+export interface Evidence {
+  id: number;
+  category: 'position' | 'holding' | 'action_result';
+  source: 'onsite' | 'device_late';
+  value: string;
+  detail: string | null;
+  observed_at: string;
+  retracted: number;
+  retract_reason: string | null;
+  retracted_at: string | null;
+  node_id?: string | null;
+  attempt?: number | null;
+}
+
 
 export interface Execution {
   id: string;
@@ -44,6 +58,8 @@ export interface Execution {
     outcome: string;
     detail: string | null;
   }[];
+  evidence?: Evidence[];
+  evidence_conflicts?: Record<string, Evidence[]>;
   waiting_for: string | null;
   manual_node?: string | null;
   current_node?: string | null;
