@@ -78,6 +78,7 @@ export interface RecoveryDecision {
   id: number;
   node_id: string | null;
   attempt: number | null;
+  episode?: number;
   decision: string;
   evidence_ids: number[];
   summary: string;
@@ -91,4 +92,12 @@ export interface ExecEvent {
   node_id: string | null;
   message: string | null;
   data: Record<string, unknown> | null;
+}
+
+export interface ExecutionSummary {
+  id: string;
+  flow_id: string;
+  status: string;
+  started_at: string;
+  updated_at: string;
 }

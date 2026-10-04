@@ -37,6 +37,7 @@ class Execution:
     in_retry_loop: bool = False  # 是否已进入过失败回路
     recovery_state: dict | None = None
     active_definition: dict | None = None
+    recovery_episode: int = 1  # 待核实轮次：处置后再崩溃开启新一轮，旧决定不重放
 
     def next_node(self, node_id: str, kind: str) -> str | None:
         definition = self.active_definition or self.definition
@@ -64,8 +65,18 @@ class Engine:
                             if record["status"] == "awaiting_manual"
                             and state.get("manual_decision") is not None
                             else state.get("recovery_decision"))
-                # 已应用过的决定（applied_ 前缀）不再自动重放，避免重启重复发出同一动作
-                if decision is not None and not str(decision).startswith("applied_"):
+                # 已应用过的决定（applied_ 前缀）不再自动重放，避免重启重复发出同一动作。
+                # 若决定已应用、但恢复后的流程在后续节点再次崩溃，则开启新一轮核实：
+                # 旧决定留痕（recovery_decisions 中可查），但允许重新登记证据与决定。
+                if decision is not None and str(decision).startswith("applied_"):
+                    # 决定已经应用：上一轮核实结束。之后再崩溃属于新一轮核实——
+                    # 不自动重放旧决定、不重复发出动作，但允许重新登记证据并再次决定。
+                    next_episode = int(state.get("recovery_episode") or 1)
+                    next_episode += 1
+                    self._save_checkpoint(
+                        execution, recovery_episode=next_episode,
+                        recovery_decision=None, decision_evidence_ids=None)
+                elif decision is not None:
                     execution.task = asyncio.create_task(self._recover(execution, decision))
 
     async def subscribe(self) -> asyncio.Queue:
@@ -93,7 +104,18 @@ class Engine:
 
     def _save_checkpoint(self, execution: Execution, **changes: object) -> None:
         state = getattr(execution, "recovery_state", {}) or {}
-        state.update({key: value for key, value in changes.items() if value is not None})
+        nullable = ("recovery_decision", "decision_evidence_ids")
+        state.update({key: value for key, value in changes.items()
+                      if value is not None or key in nullable})
+        # 恢复决定只服务于当次核实：一旦正常流程再次落检查点（新动作/等待/收尾），
+        # applied 标记即完成使命：立即结束本轮核实（轮次 +1）并清除标记。
+        # 这样在后续节点再次崩溃时开启的是新一轮核实，而不是重放旧决定。
+        if "phase" in changes and state.get("recovery_decision") is not None \
+                and str(state["recovery_decision"]).startswith("applied_"):
+            if state["phase"] in ("action", "waiting", "failure_cleanup"):
+                state["recovery_episode"] = int(state.get("recovery_episode") or 1) + 1
+            state["recovery_decision"] = None
+            state["decision_evidence_ids"] = None
         state.update({
             "flow_id": execution.flow_id,
             "definition": execution.definition,
@@ -105,6 +127,7 @@ class Engine:
             "cancel_phase": execution.cancel_phase,
             "wait_condition": execution.wait_condition,
         })
+        execution.recovery_episode = int(state.get("recovery_episode") or 1)
         state.setdefault("last_robot", self.robot.status())
         execution.recovery_state = state
         self.store.save_recovery_state(execution.id, state)
@@ -121,6 +144,7 @@ class Engine:
         execution.wait_condition = state.get("wait_condition")
         execution.manual_node = state.get("manual_node")
         execution.recovery_state = state
+        execution.recovery_episode = int(state.get("recovery_episode") or 1)
         execution.resume.set()
         if state.get("cancel_requested"):
             execution.stop.set()
@@ -216,7 +240,9 @@ class Engine:
         node_id = execution.current_node
         attempt = execution.current_attempt
         # 同一（节点,轮次）已有决定：重复确认直接拒绝，绝不再次发出同一动作
+        episode = execution.recovery_episode
         if any(d["node_id"] == node_id and d["attempt"] == attempt
+               and int(d.get("episode") or 1) == episode
                for d in self.store.list_recovery_decisions(execution_id)):
             return False
         phase = state.get("phase")
@@ -238,7 +264,8 @@ class Engine:
         evidence_ids = [e["id"] for e in active]
         summary = self._decision_summary(decision, active)
         self.store.add_recovery_decision(
-            execution_id, node_id, attempt, decision, evidence_ids, summary)
+            execution_id, node_id, attempt, decision, evidence_ids, summary,
+            episode=episode)
         self._save_checkpoint(execution, recovery_decision=decision,
                               decision_evidence_ids=evidence_ids)
         execution.task = asyncio.create_task(self._recover(execution, decision))
@@ -340,6 +367,11 @@ class Engine:
     def retract_evidence(self, execution_id: str, evidence_id: int, reason: str) -> bool:
         record = self.store.get_execution(execution_id)
         if not record:
+            return False
+        # 撤回只能作用于本执行且仍在待核实时的证据；不能撤回别的执行的观察
+        if not any(e["id"] == evidence_id for e in self.store.list_evidence(execution_id)):
+            return False
+        if record["status"] != RECOVERY_STATUS:
             return False
         if not self.store.retract_evidence(evidence_id, reason):
             return False
@@ -454,9 +486,12 @@ class Engine:
                 else state.get("late_action_outcome"))
         if late == "success":
             self._set_status(eid, "running")
+            success_detail = (outcome_evidence[-1]["value"].get("detail")
+                              if outcome_evidence
+                              else state.get("late_action_detail"))
             written = self.store.finish_node_run_guarded(
                 eid, node_id, attempt, "succeeded",
-                state.get("late_action_detail", "重启后由设备迟到回应确认完成"))
+                success_detail or "重启后经证据核实动作已完成")
             if written:
                 self._emit(eid, "node_succeeded", node_id,
                            "未确认动作经证据核实为成功，不重复执行",

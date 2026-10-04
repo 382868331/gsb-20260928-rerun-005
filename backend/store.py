@@ -87,6 +87,7 @@ class Store:
                     execution_id TEXT NOT NULL,
                     node_id TEXT,
                     attempt INTEGER,
+                    episode INTEGER NOT NULL DEFAULT 1,
                     decision TEXT NOT NULL,
                     evidence_ids TEXT,
                     summary TEXT,
@@ -100,6 +101,11 @@ class Store:
             if "termination_reason" not in cols:
                 self._conn.execute(
                     "ALTER TABLE executions ADD COLUMN termination_reason TEXT")
+            dcols = {r[1] for r in self._conn.execute(
+                "PRAGMA table_info(recovery_decisions)")}
+            if dcols and "episode" not in dcols:
+                self._conn.execute(
+                    "ALTER TABLE recovery_decisions ADD COLUMN episode INTEGER NOT NULL DEFAULT 1")
 
     def save_flow(self, flow_id: str, name: str, definition: dict[str, Any]) -> None:
         with self._lock, self._conn:
@@ -405,12 +411,13 @@ class Store:
     def add_recovery_decision(
         self, execution_id: str, node_id: str | None, attempt: int | None,
         decision: str, evidence_ids: list[int], summary: str,
+        episode: int = 1,
     ) -> None:
         with self._lock, self._conn:
             self._conn.execute(
-                "INSERT INTO recovery_decisions(execution_id,node_id,attempt,decision,evidence_ids,summary) "
-                "VALUES(?,?,?,?,?,?)",
-                (execution_id, node_id, attempt, decision,
+                "INSERT INTO recovery_decisions(execution_id,node_id,attempt,episode,decision,evidence_ids,summary) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (execution_id, node_id, attempt, episode, decision,
                  json.dumps(evidence_ids), summary),
             )
 

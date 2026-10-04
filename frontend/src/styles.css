@@ -172,3 +172,22 @@
 }
 
 .decision-panel ul { margin: 0; padding-left: 18px; }
+
+.history-panel { margin-top: 10px; }
+
+.history-list { list-style: none; margin: 0; padding: 0; max-height: 160px; overflow-y: auto; }
+
+.history-item { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; }
+
+.history-item.current .btn-link { color: #4ea876; font-weight: 600; }
+
+.history-detail {
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px solid #2c3648;
+  border-radius: 6px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.history-detail ul { margin: 0 0 8px; padding-left: 18px; }

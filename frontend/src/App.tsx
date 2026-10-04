@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import FlowCanvas from './FlowCanvas';
 import { api } from './api';
-import type { Execution, ExecEvent, Flow } from './types';
+import type { Execution, ExecEvent, ExecutionSummary, Flow } from './types';
 import type { EvidenceItem } from './types';
 
 const STATUS_TEXT: Record<string, string> = {
@@ -36,12 +36,15 @@ export default function App() {
   const [evDetail, setEvDetail] = useState('');
   const seqRef = useRef(0);
   const executionIdRef = useRef<string | null>(null);
+  const [pastExecutions, setPastExecutions] = useState<ExecutionSummary[]>([]);
+  const [history, setHistory] = useState<{ evidence: import('./types').EvidenceItem[]; decisions: import('./types').RecoveryDecision[] } | null>(null);
 
   useEffect(() => {
     api.flows().then((list) => {
       setFlows(list);
       if (list[0]) setFlowId(list[0].id);
     });
+    loadExecutions();
   }, []);
 
   const refresh = useCallback(async (id: string) => {
@@ -64,6 +67,7 @@ export default function App() {
         });
       }
       setObstacle(exec.robot.obstacle);
+      loadExecutions();
     }, 700);
     return () => clearInterval(id);
   }, [refresh]);
@@ -105,6 +109,34 @@ export default function App() {
       const { execution_id } = await api.startRun(flowId);
       executionIdRef.current = execution_id;
       setExecution(await refresh(execution_id));
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }
+
+  function loadExecutions() {
+    api.listExecutions()
+      .then(setPastExecutions)
+      .catch((err) => setError((err as Error).message));
+  }
+
+  async function reopenExecution(id: string) {
+    setError(null);
+    setHistory(null);
+    seqRef.current = 0;
+    executionIdRef.current = id;
+    try {
+      setEvents(await api.events(id));
+      setExecution(await refresh(id));
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }
+
+  async function viewHistory(id: string) {
+    setError(null);
+    try {
+      setHistory(await api.recoveryHistory(id));
     } catch (err) {
       setError((err as Error).message);
     }
@@ -240,7 +272,7 @@ export default function App() {
               >结束本次流程</button>
             </div>
           )}
-          {execution?.status === 'awaiting_recovery' && (
+          {(execution?.status === 'awaiting_recovery' || (evidence.length > 0)) && (
             <div className="evidence-panel">
               <h3>核实证据（位置 / 持物 / 动作结果）</h3>
               {hasConflict && (
@@ -289,7 +321,7 @@ export default function App() {
                     </span>
                     {item.retracted ? (
                       <span className="retract-info">已撤回：{item.retract_reason}</span>
-                    ) : (
+                    ) : execution?.status !== 'awaiting_recovery' ? null : (
                       <button className="btn-link" onClick={() => void retractEvidence(item)}>撤回</button>
                     )}
                   </li>
@@ -304,12 +336,48 @@ export default function App() {
                 {decisions.map((d) => (
                   <li key={d.id}>
                     [{d.created_at}] {d.decision === 'finish' ? '继续' : '结束'}
-                    {d.node_id ? `（节点 ${d.node_id} 第${String(d.attempt ?? 1)}次）` : ''}：{d.summary}
+                    {d.node_id ? `（节点 ${d.node_id} 第${String(d.attempt ?? 1)}次${d.episode && d.episode > 1 ? `，第${d.episode}轮核实` : ''}）` : ''}：{d.summary}
                   </li>
                 ))}
               </ul>
             </div>
           )}
+          <div className="history-panel">
+            <h3>历史执行（可重开查看证据与处置依据）</h3>
+            <ul className="history-list">
+              {pastExecutions.length === 0 && <li className="muted">暂无历史执行</li>}
+              {pastExecutions.map((item) => (
+                <li key={item.id} className={item.id === execution?.id ? 'history-item current' : 'history-item'}>
+                  <button className="btn-link" onClick={() => void reopenExecution(item.id)}>
+                    {item.id}｜{STATUS_TEXT[item.status] ?? item.status}｜{item.started_at}
+                  </button>
+                  <button className="btn-link" onClick={() => void viewHistory(item.id)}>证据/决定</button>
+                </li>
+              ))}
+            </ul>
+            {history && (
+              <div className="history-detail">
+                <h4>证据</h4>
+                <ul>
+                  {history.evidence.length === 0 && <li className="muted">无证据记录</li>}
+                  {history.evidence.map((item) => (
+                    <li key={item.id} className={item.retracted ? 'evidence-item retracted' : 'evidence-item'}>
+                      #{item.id} {CATEGORY_TEXT[item.category]}＝{evidenceValueText(item)}
+                      （{item.source === 'onsite' ? '现场观察' : '设备迟到回应'}，{item.observed_at}）
+                      {item.retracted ? ` 已撤回：${item.retract_reason ?? ''}` : ''}
+                    </li>
+                  ))}
+                </ul>
+                <h4>处置决定</h4>
+                <ul>
+                  {history.decisions.length === 0 && <li className="muted">无决定记录</li>}
+                  {history.decisions.map((d) => (
+                    <li key={d.id}>[{d.created_at}] {d.decision === 'finish' ? '继续' : '结束'}：{d.summary}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
           {flow && (
             <FlowCanvas
               nodes={flow.definition.nodes}
