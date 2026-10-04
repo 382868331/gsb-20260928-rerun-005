@@ -60,12 +60,14 @@ class Engine:
                 execution = self._hydrate_execution(state)
                 self._executions[execution.id] = execution
                 record = store.get_execution(execution.id)
-                decision = ("manual_" + state.get("manual_decision")
-                            if record["status"] == "awaiting_manual"
-                            and state.get("manual_decision") is not None
-                            else state.get("recovery_decision"))
-                # 已应用过的决定（applied_ 前缀）不再自动重放，避免重启重复发出同一动作
-                if decision is not None and not str(decision).startswith("applied_"):
+                decision: str | None = None
+                if record["status"] == "awaiting_manual" and state.get("manual_decision") is not None:
+                    decision = "manual_" + str(state["manual_decision"])
+                elif state.get("pending_decision") is not None:
+                    # 仅重放“已提交但尚未应用完”的决定；上一决定已应用后，
+                    # 恢复出的尾部执行再次崩溃属于新的待核实周期，可重新登记决定。
+                    decision = str(state["pending_decision"])
+                if decision is not None:
                     execution.task = asyncio.create_task(self._recover(execution, decision))
 
     async def subscribe(self) -> asyncio.Queue:
@@ -93,7 +95,11 @@ class Engine:
 
     def _save_checkpoint(self, execution: Execution, **changes: object) -> None:
         state = getattr(execution, "recovery_state", {}) or {}
-        state.update({key: value for key, value in changes.items() if value is not None})
+        for key, value in changes.items():
+            if value is None:
+                state.pop(key, None)
+            else:
+                state[key] = value
         state.update({
             "flow_id": execution.flow_id,
             "definition": execution.definition,
@@ -211,7 +217,7 @@ class Engine:
             return False
         decision = "finish" if finish else "abort"
         state = execution.recovery_state or {}
-        if state.get("recovery_decision") is not None:
+        if state.get("pending_decision") is not None:
             return False
         node_id = execution.current_node
         attempt = execution.current_attempt
@@ -239,7 +245,9 @@ class Engine:
         summary = self._decision_summary(decision, active)
         self.store.add_recovery_decision(
             execution_id, node_id, attempt, decision, evidence_ids, summary)
-        self._save_checkpoint(execution, recovery_decision=decision,
+        # pending_decision 表示“已提交、待应用”：应用过程中崩溃可在重启后重放；
+        # 应用开始后该标记清除，恢复出的尾部执行再次崩溃时可重新核实与决定。
+        self._save_checkpoint(execution, pending_decision=decision,
                               decision_evidence_ids=evidence_ids)
         execution.task = asyncio.create_task(self._recover(execution, decision))
         return True
@@ -354,8 +362,10 @@ class Engine:
         node_id = state.get("current_node")
         attempt = int(state.get("current_attempt", 1))
         evidence_ids = state.get("decision_evidence_ids") or []
-        # 决定一经应用即定格（applied_ 前缀）：重启不会重放同一决定、重复发出同一动作
-        self._save_checkpoint(execution, recovery_decision=f"applied_{decision}")
+        # 决定开始应用即清除“待应用”标记：重启不会重放同一决定、重复发出同一动作；
+        # 恢复出的尾部执行若再次崩溃，属于新的待核实周期，可重新登记证据与决定。
+        self._save_checkpoint(execution, pending_decision=None,
+                              recovery_decision=f"applied_{decision}")
         self._emit(eid, "recovery_decision_saved",
                    message=f"恢复处置已保存：{decision}",
                    data={"decision": decision, "evidence_ids": evidence_ids})
@@ -403,8 +413,11 @@ class Engine:
             return
 
         if phase == "waiting":
-            self._set_status(eid, "waiting")
+            # 恢复出的是全新事件对象，必须重新关联等待条件并清掉置位，
+            # 否则恢复后页面再次“满足条件”无法唤醒该等待节点。
             execution.wait_condition = state.get("wait_condition")
+            execution.condition_met = asyncio.Event()
+            self._set_status(eid, "waiting")
             self._emit(eid, "recovery_waiting", message="恢复到原等待条件；未发出新的移动")
             execution.task = asyncio.current_task()
             node_id = state.get("current_node")

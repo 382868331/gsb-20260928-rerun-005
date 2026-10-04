@@ -150,3 +150,90 @@ async def test_evidence_and_pending_state_survive_restart(tmp_path):
     decisions = engine3.store.list_recovery_decisions(eid)
     assert len(decisions) == 1
     assert engine3.store.list_evidence(eid)  # 证据历史仍可独立查看
+
+
+WAIT_AFTER_MOVE_FLOW = {
+    "nodes": [
+        {"id": "m", "type": "move", "label": "移动", "params": {"x": 6, "y": 0}},
+        {"id": "w", "type": "wait", "label": "等待",
+         "params": {"condition": "shelf_ready"}},
+        {"id": "n", "type": "log", "label": "下一步", "params": {"message": "go"}},
+    ],
+    "edges": [
+        {"id": "1", "source": "m", "target": "w", "kind": "success"},
+        {"id": "2", "source": "w", "target": "n", "kind": "success"},
+    ],
+}
+
+
+async def _kill_all(engine):
+    for execution in list(engine._executions.values()):
+        execution.task.cancel()
+    await asyncio.sleep(0.1)
+
+
+async def test_new_crash_after_resolved_decision_allows_fresh_recovery(tmp_path):
+    """处置决定应用后，恢复出的尾部执行再次崩溃：新一轮仍可登记证据并决定。"""
+    db = tmp_path / "twice.db"
+    store = Store(db)
+    engine = Engine(store, VirtualRobot())
+    eid = engine.start("flow1", WAIT_AFTER_MOVE_FLOW)
+    await wait_until(
+        lambda: any(nr["node_id"] == "m" and nr["status"] == "running"
+                    for nr in store.get_execution(eid)["node_runs"]))
+    await _kill_all(engine)
+
+    s2 = Store(db)
+    e2 = Engine(s2, VirtualRobot())
+    assert s2.get_execution(eid)["status"] == "awaiting_recovery"
+    assert e2.record_late_action(eid, "success", "设备迟到确认到位")
+    assert e2.resolve_recovery(eid, finish=True)
+    await wait_until(lambda: s2.get_execution(eid)["status"] == "waiting")
+    await asyncio.sleep(0.1)
+    await _kill_all(e2)
+
+    s3 = Store(db)
+    e3 = Engine(s3, VirtualRobot())
+    assert s3.get_execution(eid)["status"] == "awaiting_recovery"
+    evidence_id = e3.record_evidence(
+        eid, "position", "onsite", {"x": 6, "y": 0})
+    assert evidence_id is not None
+    e3.record_evidence(eid, "holding", "onsite", {"holding": None})
+    assert e3.resolve_recovery(eid, finish=True)
+    await wait_until(lambda: s3.get_execution(eid)["status"] == "waiting")
+    await asyncio.sleep(0.1)
+    assert e3.signal(eid, "shelf_ready")
+    await wait_until(lambda: s3.get_execution(eid)["status"] == "succeeded")
+
+    final = s3.get_execution(eid)
+    move_runs = [nr for nr in final["node_runs"] if nr["node_id"] == "m"]
+    assert len(move_runs) == 1 and move_runs[0]["status"] == "succeeded"
+    decisions = s3.list_recovery_decisions(eid)
+    assert [d["decision"] for d in decisions] == ["finish", "finish"]
+    # 第二次决定只引用第二次崩溃周期登记的证据
+    assert decisions[1]["evidence_ids"] == [evidence_id, evidence_id + 1]
+
+
+async def test_pending_decision_replayed_after_restart_mid_apply(tmp_path):
+    """决定已提交但应用过程中崩溃：重启自动续作，操作者无需重复确认。"""
+    db = tmp_path / "pending.db"
+    store = Store(db)
+    engine = Engine(store, VirtualRobot())
+    eid = engine.start("flow1", MOVE_FLOW)
+    await wait_until(
+        lambda: any(nr["node_id"] == "m" and nr["status"] == "running"
+                    for nr in store.get_execution(eid)["node_runs"]))
+    await _kill_all(engine)
+
+    s2 = Store(db)
+    e2 = Engine(s2, VirtualRobot())
+    assert e2.record_late_action(eid, "success", "设备迟到确认到位")
+    assert e2.resolve_recovery(eid, finish=True)
+    assert s2.get_recovery_state(eid).get("pending_decision") == "finish"
+    await _kill_all(e2)
+
+    s3 = Store(db)
+    Engine(s3, VirtualRobot())  # 构造即应自动重放待应用决定
+    await wait_until(lambda: s3.get_execution(eid)["status"] == "succeeded")
+    decisions = s3.list_recovery_decisions(eid)
+    assert len(decisions) == 1  # 重放不产生重复决定
