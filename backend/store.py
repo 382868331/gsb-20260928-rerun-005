@@ -349,6 +349,35 @@ class Store:
             ).fetchone()
         return json.loads(row["state"]) if row else None
 
+    def list_pending_recovery_executions(self) -> list[dict[str, Any]]:
+        """列出持久化层面仍待人工核实/处置的执行。
+
+        重启恢复以该结果为唯一来源：执行状态一旦落库为
+        awaiting_recovery/awaiting_manual，就必须能找回处置入口，
+        即使 recovery_states 行因异常缺失（孤儿待核实状态）也要补建，
+        避免页面显示待核实、证据入口却判定“不在待核实状态”。
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, flow_id, status FROM executions "
+                "WHERE status IN ('awaiting_recovery','awaiting_manual')"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def last_unconfirmed_node_run(
+        self, execution_id: str,
+    ) -> tuple[str, int, str, str | None] | None:
+        """从 node_runs 重建待核实时的未确认动作（节点, 轮次, 状态, 详情）。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT node_id, attempt, status, detail FROM node_runs "
+                "WHERE execution_id=? ORDER BY id DESC LIMIT 1",
+                (execution_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return row["node_id"], int(row["attempt"]), row["status"], row["detail"]
+
     def list_recovery_states(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(

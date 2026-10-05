@@ -237,3 +237,115 @@ async def test_pending_decision_replayed_after_restart_mid_apply(tmp_path):
     await wait_until(lambda: s3.get_execution(eid)["status"] == "succeeded")
     decisions = s3.list_recovery_decisions(eid)
     assert len(decisions) == 1  # 重放不产生重复决定
+
+
+async def test_orphan_pending_execution_still_accepts_evidence(tmp_path):
+    """恢复检查点缺失时：持久化状态仍为待核实，证据/迟到回应入口必须可用，
+    并登记到原来的未确认动作（节点, 轮次），不重发移动。"""
+    db = tmp_path / "orphan.db"
+    eid = await crash_while_moving(db)
+
+    # 模拟异常情况下 recovery_states 行丢失，但 executions 已是待核实
+    store0 = Store(db)
+    store0.delete_recovery_state(eid)
+
+    store = Store(db)
+    engine = Engine(store, VirtualRobot())
+    assert store.get_execution(eid)["status"] == "awaiting_recovery"
+    # 活动执行对象按持久化状态补建，页面与入口判断一致（不再 409）
+    execution = engine.get(eid)
+    assert execution is not None
+    assert (execution.current_node, execution.current_attempt) == ("m", 1)
+
+    evidence_id = engine.record_evidence(
+        eid, "position", "onsite", {"x": 3, "y": 0})
+    assert evidence_id is not None
+    assert engine.record_evidence(
+        eid, "holding", "onsite", {"holding": None}) is not None
+    assert engine.record_late_action(eid, "success", "设备迟到确认到位")
+    evidence = store.list_evidence(eid)
+    assert all((e["node_id"], e["attempt"]) == ("m", 1) for e in evidence)
+    assert engine.resolve_recovery(eid, finish=True)
+    await wait_until(lambda: store.get_execution(eid)["status"] == "succeeded")
+    # 原移动只执行一次，没有因为补建而重发
+    move_runs = [nr for nr in store.get_execution(eid)["node_runs"]
+                 if nr["node_id"] == "m"]
+    assert len(move_runs) == 1 and move_runs[0]["status"] == "succeeded"
+
+
+async def test_abort_requires_evidence_and_runs_cleanup_without_resend(tmp_path):
+    """结束决定也必须引用有效证据；结束走安全收尾，未确认动作不重发，原因保留。"""
+    db = tmp_path / "abort.db"
+    eid = await crash_while_moving(db)
+    store = Store(db)
+    engine = Engine(store, VirtualRobot())
+
+    # 无证据：结束被阻止，保持待核实
+    assert not engine.resolve_recovery(eid, finish=False)
+    assert store.get_execution(eid)["status"] == "awaiting_recovery"
+    assert any(e["type"] == "recovery_blocked_missing_evidence"
+               for e in store.get_events(eid))
+
+    assert engine.record_evidence(
+        eid, "position", "onsite", {"x": 3, "y": 0}) is not None
+    assert engine.resolve_recovery(eid, finish=False)
+    await wait_until(lambda: store.get_execution(eid)["status"] == "resolved")
+    record = store.get_execution(eid)
+    move_runs = [nr for nr in record["node_runs"] if nr["node_id"] == "m"]
+    assert len(move_runs) == 1  # 没有重新发出移动
+    decisions = store.list_recovery_decisions(eid)
+    assert len(decisions) == 1 and decisions[0]["decision"] == "abort"
+    assert decisions[0]["evidence_ids"]  # 决定引用了有效证据
+    assert record["termination_reason"]
+
+
+async def test_retracted_evidence_and_disposition_survive_restart(tmp_path):
+    """撤回保留原因；再次重启后能打开同一处置并看到已撤回记录。"""
+    db = tmp_path / "retract.db"
+    eid = await crash_while_moving(db)
+    s1 = Store(db)
+    e1 = Engine(s1, VirtualRobot())
+    ev_good = e1.record_evidence(
+        eid, "position", "onsite", {"x": 6, "y": 0})
+    ev_wrong = e1.record_evidence(
+        eid, "position", "device", {"x": 2, "y": 2})
+    assert "position" in e1.evidence_conflicts(eid, "m", 1)
+    reason = "设备坐标上报对应另一台机器人，撤回该观察"
+    assert e1.retract_evidence(eid, ev_wrong, reason)
+    # 撤回后矛盾解除
+    assert e1.evidence_conflicts(eid, "m", 1) == {}
+
+    # 尚未做决定就再次重启：同一处置仍可打开，撤回原因与证据历史都在
+    s2 = Store(db)
+    e2 = Engine(s2, VirtualRobot())
+    assert s2.get_execution(eid)["status"] == "awaiting_recovery"
+    items = {e["id"]: e for e in s2.list_evidence(eid)}
+    assert items[ev_wrong]["retracted"] is True
+    assert items[ev_wrong]["retract_reason"] == reason
+    assert items[ev_good]["retracted"] is False
+    assert (e2.get(eid).current_node, e2.get(eid).current_attempt) == ("m", 1)
+
+
+async def test_late_action_for_new_task_not_attributed_to_old_recovery(tmp_path):
+    """旧执行待核实时启动新任务：新任务的回应/证据只属于新执行。"""
+    db = tmp_path / "cross.db"
+    old_id = await crash_while_moving(db)
+    s = Store(db)
+    old_engine = Engine(s, VirtualRobot())
+    assert s.get_execution(old_id)["status"] == "awaiting_recovery"
+
+    # 另起一个新任务并也跑到移动中
+    new_id = old_engine.start("flow1", MOVE_FLOW)
+    await wait_until(
+        lambda: any(nr["node_id"] == "m" and nr["status"] == "running"
+                    for nr in s.get_execution(new_id)["node_runs"]))
+
+    # 给旧执行登记迟到回应：只落到旧 (m,1)，不出现在新执行
+    assert old_engine.record_late_action(old_id, "success", "旧任务迟到到位")
+    old_evidence = s.list_evidence(old_id)
+    assert old_evidence and all(e["execution_id"] == old_id
+                                for e in old_evidence)
+    assert s.list_evidence(new_id) == []
+    # 新执行不是待核实状态，不能借用旧执行的证据入口
+    assert old_engine.record_evidence(
+        new_id, "position", "onsite", {"x": 0, "y": 0}) is None

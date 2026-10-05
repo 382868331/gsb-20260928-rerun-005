@@ -53,22 +53,56 @@ class Engine:
         self._executions: dict[str, Execution] = {}
         self._subscribers: set[asyncio.Queue] = set()
         store.mark_stale_running()
-        for state in store.list_recovery_states():
-            if store.get_execution(state["execution_id"])["status"] in (
-                RECOVERY_STATUS, "awaiting_manual"
-            ):
-                execution = self._hydrate_execution(state)
-                self._executions[execution.id] = execution
-                record = store.get_execution(execution.id)
-                decision: str | None = None
-                if record["status"] == "awaiting_manual" and state.get("manual_decision") is not None:
-                    decision = "manual_" + str(state["manual_decision"])
-                elif state.get("pending_decision") is not None:
-                    # 仅重放“已提交但尚未应用完”的决定；上一决定已应用后，
-                    # 恢复出的尾部执行再次崩溃属于新的待核实周期，可重新登记决定。
-                    decision = str(state["pending_decision"])
-                if decision is not None:
-                    execution.task = asyncio.create_task(self._recover(execution, decision))
+        # 重启恢复以持久化执行状态为唯一来源：只要 executions 行处于待核实/
+        # 待处置，就必须恢复出活动执行对象；recovery_states 缺失时按 node_runs
+        # 补建检查点，杜绝“页面待核实、入口却判定不在待核实状态”的矛盾。
+        for record in store.list_pending_recovery_executions():
+            execution_id = record["id"]
+            state = store.get_recovery_state(execution_id)
+            if state is None:
+                state = self._rebuild_recovery_state(record)
+                store.save_recovery_state(execution_id, state)
+                self._emit(execution_id, "recovery_checkpoint_rebuilt",
+                           state.get("current_node"),
+                           "重启后未找到检查点，已按持久化节点记录补建待核实上下文；不会重发动作",
+                           data={"attempt": state.get("current_attempt")})
+            execution = self._hydrate_execution(state)
+            self._executions[execution_id] = execution
+            decision: str | None = None
+            if record["status"] == "awaiting_manual" and state.get("manual_decision") is not None:
+                decision = "manual_" + str(state["manual_decision"])
+            elif state.get("pending_decision") is not None:
+                # 仅重放“已提交但尚未应用完”的决定；上一决定已应用后，
+                # 恢复出的尾部执行再次崩溃属于新的待核实周期，可重新登记决定。
+                decision = str(state["pending_decision"])
+            if decision is not None:
+                execution.task = asyncio.create_task(self._recover(execution, decision))
+
+    def _rebuild_recovery_state(self, record: dict) -> dict:
+        """检查点缺失时，依据 flow 定义与 node_runs 补建待核实上下文。"""
+        execution_id = record["id"]
+        flow_id = record["flow_id"]
+        flow = self.store.get_flow(flow_id)
+        definition = (flow or {}).get("definition") or {"nodes": [], "edges": []}
+        state: dict = {
+            "execution_id": execution_id,
+            "flow_id": flow_id,
+            "definition": definition,
+            "phase": "manual" if record["status"] == "awaiting_manual" else "action",
+            "attempts": {},
+        }
+        last = self.store.last_unconfirmed_node_run(execution_id)
+        if last is not None:
+            node_id, attempt, _status, detail = last
+            state["current_node"] = node_id
+            state["current_attempt"] = attempt
+            state["attempts"] = {node_id: attempt}
+            if record["status"] == "awaiting_manual":
+                state["manual_node"] = node_id
+            if detail:
+                state["last_progress"] = detail
+        state["last_robot"] = self.robot.status()
+        return state
 
     async def subscribe(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=256)
@@ -211,10 +245,10 @@ class Engine:
         return True
 
     def resolve_recovery(self, execution_id: str, finish: bool) -> bool:
-        execution = self._executions.get(execution_id)
-        record = self.store.get_execution(execution_id)
-        if not execution or not record or record["status"] != RECOVERY_STATUS:
+        target = self._recovery_target(execution_id)
+        if target is None:
             return False
+        execution, record = target
         decision = "finish" if finish else "abort"
         state = execution.recovery_state or {}
         if state.get("pending_decision") is not None:
@@ -227,20 +261,26 @@ class Engine:
             return False
         phase = state.get("phase")
         active = self._active_evidence(execution_id, node_id, attempt)
-        if finish:
-            conflicts = self.evidence_conflicts(execution_id, node_id, attempt)
-            if conflicts:
-                self._emit(execution_id, "recovery_blocked_conflict", node_id,
-                           "有效证据互相矛盾，继续执行被阻止；请撤回错误观察后再决定",
-                           data={"attempt": attempt, "conflicts": conflicts})
-                return False
-            if phase == "action" and not execution.stop.is_set():
-                # 动作结果未确认时，缺少动作结果证据不得继续，保持待核实
-                if not any(e["category"] == "action_result" for e in active):
-                    self._emit(execution_id, "recovery_blocked_missing_evidence", node_id,
-                               "缺少动作结果证据，保持待核实",
-                               data={"attempt": attempt})
-                    return False
+        # 矛盾证据对任何处置都阻断。
+        conflicts = self.evidence_conflicts(execution_id, node_id, attempt)
+        if conflicts:
+            self._emit(execution_id, "recovery_blocked_conflict", node_id,
+                       "有效证据互相矛盾，处置被阻止；请撤回错误观察后再决定",
+                       data={"attempt": attempt, "decision": decision,
+                             "conflicts": conflicts})
+            return False
+        required = self._required_evidence_categories(execution, phase, finish)
+        missing = [cat for cat in required
+                   if not any(e["category"] == cat for e in active)]
+        # 只有存在“未确认动作”（action 阶段）时，继续/结束才必须引用有效证据；
+        # 等待/失败收尾/人工节点的处置依据是已落库的持久化事实，不强制证据。
+        need_any = phase == "action"
+        if missing or (need_any and not active):
+            self._emit(execution_id, "recovery_blocked_missing_evidence", node_id,
+                       "处置决定必须引用有效证据；证据不足，保持待核实",
+                       data={"attempt": attempt, "decision": decision,
+                             "missing": missing or (["any"] if need_any else [])})
+            return False
         evidence_ids = [e["id"] for e in active]
         summary = self._decision_summary(decision, active)
         self.store.add_recovery_decision(
@@ -255,11 +295,79 @@ class Engine:
     @staticmethod
     def _decision_summary(decision: str, active: list[dict]) -> str:
         label = "继续" if decision == "finish" else "结束"
-        if not active:
-            return f"人工决定{label}；无有效证据可依赖"
         parts = [f"#{e['id']} {e['category']}/{e['source']}={e['value']}"
                  for e in active]
         return f"人工决定{label}，依据证据：" + "；".join(parts)
+
+    def _recovery_target(
+        self, execution_id: str,
+    ) -> tuple[Execution, dict] | None:
+        """统一解析待核实处置目标，避免持久化状态与活动对象判断不一致。
+
+        以 executions 持久化状态为准：处于 awaiting_recovery 时，即使内存对象
+        缺失也按恢复检查点重新水合，保证证据/迟到回应/处置都登记到原来的
+        未确认动作，而不是被 409 拒绝或落到新任务上。
+        """
+        record = self.store.get_execution(execution_id)
+        if record is None or record["status"] != RECOVERY_STATUS:
+            return None
+        execution = self._executions.get(execution_id)
+        if execution is None:
+            state = self.store.get_recovery_state(execution_id)
+            if state is None:
+                state = self._rebuild_recovery_state(record)
+                self.store.save_recovery_state(execution_id, state)
+                self._emit(execution_id, "recovery_checkpoint_rebuilt",
+                           state.get("current_node"),
+                           "待核实入口重新补建检查点；证据登记到原未确认动作，不重发动作",
+                           data={"attempt": state.get("current_attempt")})
+            execution = self._hydrate_execution(state)
+            self._executions[execution_id] = execution
+        elif execution.recovery_state is None:
+            state = self.store.get_recovery_state(execution_id)
+            if state is not None:
+                execution.recovery_state = state
+                execution.current_node = state.get("current_node")
+                execution.current_attempt = int(state.get("current_attempt") or 0)
+        return execution, record
+
+    @staticmethod
+    def _required_evidence_categories(
+        execution: Execution, phase: str | None, finish: bool,
+    ) -> list[str]:
+        """处置决定必须依赖的证据类别。
+
+        仅针对未确认动作（action 阶段）：继续必须有动作结果证据；结束也必须
+        引用至少一条有效证据（由调用方统一校验非空）。
+        位置/持物无证据时恢复逻辑回退到最后已知快照，因此不强制。
+        """
+        if phase != "action":
+            return []
+        if finish and not execution.stop.is_set():
+            return ["action_result"]
+        return []  # 结束至少引用一条有效证据，由统一非空校验保证
+
+    def _has_newer_live_execution(self, execution_id: str) -> bool:
+        """是否存在比当前旧执行更晚启动、仍在活动的新任务。
+
+        防止恢复旧执行时用旧设备快照覆盖新任务；证据与迟到回应按各自的
+        execution_id 分别落库，天然不会串任务。
+        """
+        current = self._executions.get(execution_id)
+        current_started = None
+        record = self.store.get_execution(execution_id)
+        if record is not None:
+            current_started = record["started_at"]
+        for other_id, other in self._executions.items():
+            if other_id == execution_id or other.task is None:
+                continue
+            other_record = self.store.get_execution(other_id)
+            if other_record is None:
+                continue
+            if other_record["status"] in ("running", "waiting", "paused", "cancelling"):
+                if current_started is None or other_record["started_at"] >= current_started:
+                    return True
+        return False
 
     async def _gate(self, execution: Execution) -> None:
         while execution.paused and not execution.stop.is_set():
@@ -269,10 +377,10 @@ class Engine:
                 pass
 
     def record_late_action(self, execution_id: str, outcome: str, detail: str) -> bool:
-        execution = self._executions.get(execution_id)
-        record = self.store.get_execution(execution_id)
-        if not execution or not record or record["status"] != RECOVERY_STATUS:
+        target = self._recovery_target(execution_id)
+        if target is None:
             return False
+        execution, _record = target
         node_id = execution.current_node
         attempt = execution.current_attempt
         if not node_id or not attempt:
@@ -326,10 +434,10 @@ class Engine:
     def record_evidence(self, execution_id: str, category: str, source: str,
                         value: dict, observed_at: str | None = None) -> int | None:
         """登记现场观察/设备回应证据；与既有证据矛盾时并保留，不覆盖旧记录。"""
-        execution = self._executions.get(execution_id)
-        record = self.store.get_execution(execution_id)
-        if not execution or not record or record["status"] != RECOVERY_STATUS:
+        target = self._recovery_target(execution_id)
+        if target is None:
             return None
+        execution, _record = target
         if category not in ("position", "holding", "action_result"):
             return None
         node_id = execution.current_node
@@ -348,6 +456,12 @@ class Engine:
     def retract_evidence(self, execution_id: str, evidence_id: int, reason: str) -> bool:
         record = self.store.get_execution(execution_id)
         if not record:
+            return False
+        # 只能撤回本执行的证据；已结束执行仅可查看历史，不再改动证据
+        if record["status"] not in (RECOVERY_STATUS, "awaiting_manual"):
+            return False
+        if not any(e["id"] == evidence_id
+                   for e in self.store.list_evidence(execution_id)):
             return False
         if not self.store.retract_evidence(evidence_id, reason):
             return False
@@ -378,10 +492,20 @@ class Engine:
                 last_robot["y"] = e["value"].get("y", last_robot.get("y", 0))
             elif e["category"] == "holding":
                 last_robot["holding"] = e["value"].get("holding")
-        self.robot.state.x = float(last_robot.get("x", 0))
-        self.robot.state.y = float(last_robot.get("y", 0))
-        self.robot.state.holding = last_robot.get("holding")
-        self.robot.state.idle = True
+
+        async def apply_robot_snapshot() -> None:
+            # 恢复旧执行时，若已有后来启动的活动任务（如用户先开了新任务），
+            # 不能用旧快照覆盖共享设备状态；旧执行的核实结论只用于其自身的
+            # 收尾/分支判定，迟到回应也只登记到旧执行身份。
+            if self._has_newer_live_execution(eid):
+                self._emit(eid, "recovery_robot_snapshot_skipped", node_id,
+                           "检测到后来启动的新任务，恢复不覆盖当前设备状态",
+                           data={"attempt": attempt})
+                return
+            self.robot.state.x = float(last_robot.get("x", 0))
+            self.robot.state.y = float(last_robot.get("y", 0))
+            self.robot.state.holding = last_robot.get("holding")
+            self.robot.state.idle = True
 
         phase = state.get("phase")
         failure_detail = state.get("failure_detail")
@@ -390,11 +514,30 @@ class Engine:
             reason += f"；原故障：{failure_detail}"
 
         if decision == "abort":
+            # 结束同样执行安全收尾，但原未确认动作绝不重发；未确认动作身份保留。
+            if node_id:
+                uncertain = next((n for n in execution.definition["nodes"]
+                                  if n["id"] == node_id), None)
+                if uncertain is not None:
+                    self.store.add_node_followup(
+                        eid, node_id, attempt, "recovery", "aborted",
+                        "人工核实后选择结束；原动作结果保留为后续信息，不重复执行该动作")
+                    self._save_checkpoint(execution, phase="recovery_abort_cleanup",
+                                          abort_reason=reason)
+                    await apply_robot_snapshot()
+                    await self._run_failure_cleanup(
+                        execution, uncertain, attempt,
+                        failure_detail or "重启前动作结果无法确认",
+                        resuming=True)
             self.store.set_execution_status(eid, "resolved", reason)
             self._emit(eid, "execution_finished", message="人工核实后结束流程",
                        data={"status": "resolved", "reason": reason})
             self.store.delete_recovery_state(eid)
             return
+
+        # 所有“继续”路径在重新驱动设备前统一应用证据快照；
+        # abort 分支已在其收尾前单独应用。
+        await apply_robot_snapshot()
 
         if phase == "manual":
             node_id = state.get("manual_node") or state.get("current_node")
